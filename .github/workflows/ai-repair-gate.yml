@@ -1,0 +1,50 @@
+name: ai-repair-quorum-gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+# Pull request text is untrusted. Never use pull_request_target here.
+permissions:
+  contents: read
+
+jobs:
+  independently-verify-ai-repairs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # The verifier and approved command registry are read from trusted main,
+      # NOT from the AI's pull request branch.
+      - name: Checkout trusted auditor
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: verifier
+          persist-credentials: false
+      - name: Checkout exact subject commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          path: subject
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install trusted Quorum with tests
+        run: python -m pip install -e './verifier[dev]'
+      - name: Independently verify claims with Quorum
+        run: |
+          python verifier/gateway/repair_gateway.py audit \
+            --event "$GITHUB_EVENT_PATH" \
+            --subject "$GITHUB_WORKSPACE/subject" \
+            --registry "$GITHUB_WORKSPACE/verifier/gateway/checks.json" \
+            --out "$GITHUB_WORKSPACE/audit-evidence"
+      - name: Preserve independent evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-repair-evidence-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: audit-evidence/
+          if-no-files-found: warn
+          retention-days: 90
