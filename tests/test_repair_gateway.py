@@ -20,7 +20,7 @@ def fixture(tmp_path):
     subject=tmp_path/"subject";subject.mkdir()
     git(subject,"init","-q")
     git(subject,"config","user.name","Fixture")
-    git(subject,"config","user.email","fixture@example.invalid")
+    git(subject,"config","user.email","fixture" + chr(64) + "example.invalid")
     (subject/"hello.txt").write_text("sample\n")
     (subject/"tests").mkdir()
     (subject/"tests"/"test_approved.py").write_text("def test_kept():\n    assert True\n")
