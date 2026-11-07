@@ -395,3 +395,7 @@ quorum verify --config reviews/review.yaml     # 24 条断言，全部会真跑
 ## 许可
 
 MIT
+
+## Universal AI Audit CI Test
+
+Initial GitHub Actions verification.
