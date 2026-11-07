@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "checks": {
+    "quorum-ledger-verdicts": {
+      "argv": [
+        "python3",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_quorum.py::test_ledger_verdicts"
+      ],
+      "timeout_seconds": 180,
+      "regression_for": [
+        "quorum.ledger.false_repair"
+      ],
+      "protected_paths": [
+        "tests/test_quorum.py"
+      ]
+    },
+    "quorum-verifier-exit": {
+      "argv": [
+        "python3",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_quorum.py::test_verify_exit_code_survives_incident_write_failure"
+      ],
+      "timeout_seconds": 180,
+      "regression_for": [
+        "quorum.ledger.false_repair"
+      ],
+      "protected_paths": [
+        "tests/test_quorum.py"
+      ]
+    },
+    "quorum-all-unit": {
+      "argv": [
+        "python3",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "timeout_seconds": 400,
+      "regression_for": []
+    }
+  }
+}
