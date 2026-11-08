@@ -1,0 +1,102 @@
+name: ai-repair-quorum-gate
+
+# SECURITY BOUNDARY: GitHub reads this workflow from the trusted default branch.
+# An untrusted PR may not change the workflow that evaluates that PR.
+# This event requires an explicit GitHub Actions event-policy review for public repos.
+on:
+  pull_request_target:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+# Repository and organization secrets are not referenced or passed to the sandbox.
+# No credentials are saved in the checked-out worktrees.
+permissions:
+  contents: read
+
+jobs:
+  independently-verify-ai-repairs:
+    name: independently-verify-ai-repairs
+    if: github.event.pull_request.head.sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned reviewed verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, exact SHA verified from GitHub
+        with:
+          ref: 17a50786a6936fec5f9d0574562070230d3ce09b
+          path: verifier
+          persist-credentials: false
+
+      - name: Checkout exact untrusted subject SHA as DATA only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          path: subject
+          persist-credentials: false
+
+      - name: Checkout exact trusted PR base SHA as DATA only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      # Build an image only from the pinned trusted verifier tree. Never build
+      # untrusted PR Dockerfiles or run install scripts from the PR worktree.
+      - name: Build isolated verification image from reviewed verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/quorum-gateway.Dockerfile" <<'DOCKERFILE'
+          FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+          RUN apt-get update && apt-get install -y --no-install-recommends git \
+              && rm -rf /var/lib/apt/lists/* \
+              && echo 'runner:x:1001:1001:GitHub Actions runner:/tmp:/usr/sbin/nologin' >> /etc/passwd \
+              && git config --system --add safe.directory /trusted
+          COPY . /trusted
+          RUN python -m pip install --no-cache-dir -e '/trusted[dev]'
+          WORKDIR /subject
+          DOCKERFILE
+          docker build --pull -f "$RUNNER_TEMP/quorum-gateway.Dockerfile" \
+            -t quorum-gateway-reviewed:latest "$GITHUB_WORKSPACE/verifier"
+
+      # All PR-controlled source, tests, build hooks and manifest content are
+      # processed INSIDE the transient sandbox; GitHub token and secrets are
+      # never mounted into the container or provided in the environment.
+      - name: Independent audit in disposable no-network sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/audit-evidence"
+          docker run --rm \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --memory 2g --memory-swap=2g --pids-limit 256 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,exec,size=256m \
+            --mount "type=bind,src=$GITHUB_EVENT_PATH,dst=/event.json,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/subject,dst=/subject,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/base,dst=/base,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/audit-evidence,dst=/audit-evidence" \
+            --env HOME=/tmp --env PYTHONDONTWRITEBYTECODE=1 \
+            --env 'PYTEST_ADDOPTS=-p no:cacheprovider' \
+            quorum-gateway-reviewed:latest \
+              python /trusted/gateway/repair_gateway.py audit \
+                --event /event.json \
+                --subject /subject \
+                --base /base \
+                --registry /trusted/gateway/checks.json \
+                --out /audit-evidence
+
+      - name: Preserve audit evidence even if validation fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 pinned SHA
+        with:
+          name: ai-repair-evidence-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: audit-evidence/
+          if-no-files-found: error
+          retention-days: 90
