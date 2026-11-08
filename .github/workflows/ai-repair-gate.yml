@@ -24,7 +24,7 @@ jobs:
       - name: Checkout pinned reviewed verifier
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, exact SHA verified from GitHub
         with:
-          ref: 1eff223c2ea3bcdc78967629d539386070627e53
+          ref: 17a50786a6936fec5f9d0574562070230d3ce09b
           path: verifier
           persist-credentials: false
 
