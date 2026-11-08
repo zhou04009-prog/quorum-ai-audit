@@ -45,7 +45,7 @@ def test_sandbox_is_offline_and_credentials_not_forwarded():
 
 def test_trusted_verifier_pinned():
     first=steps[0]
-    assert first['with']['ref']=='17a50786a6936fec5f9d0574562070230d3ce09b'
+    assert first['with']['ref']=='e8fd91438a2c2b3ccb85b891d8a375537dbabaec'
     assert first['with']['path']=='verifier'
 
 def test_artifact_preserved_on_fail():

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 import shutil
@@ -8,6 +9,16 @@ import pytest
 
 ROOT=Path(__file__).resolve().parents[1]
 SCRIPT=ROOT/"gateway"/"repair_gateway.py"
+
+
+def _load_gateway():
+    spec = importlib.util.spec_from_file_location("repair_gateway_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+RG = _load_gateway()
 
 
 def git(repo,*args):
@@ -303,3 +314,158 @@ def test_claim_marker_duplicated_does_not_skip(nonrepair_fixture):
     body = "<!-- quorum-ai-repair\n{}\n-->\n<!-- quorum-ai-repair\n{}\n-->"
     p, r = nonrepair_fixture({"README.md": "change\n"}, body=body)
     assert p.returncode == 1 and r["decision"] == "EVIDENCE_MISSING"
+
+
+# ---------------------------------------------------------------------------
+# Trusted test executor v2 (2026-11-08): the pass verdict must rest on
+# structured junitxml evidence from a hardened pytest invocation, never on
+# output strings. These tests use only harmless probes (a standard
+# --collect-only config flag, a marker-writing sitecustomize, and direct
+# XML parsing) — no forged-pass plugin is created anywhere.
+# ---------------------------------------------------------------------------
+
+def _pytest_registry(tmp_path, check_id="pytest-regression"):
+    trusted = tmp_path / "trusted2"
+    registry = trusted / "gateway" / "checks.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"schema_version": 1, "checks": {
+        check_id: {"argv": ["python3", "-m", "pytest", "-v", "--noconftest",
+                            "tests/test_approved.py::test_kept"],
+                   "timeout_seconds": 60, "regression_for": ["bug.fault"],
+                   "protected_paths": ["tests/test_approved.py"]}}}))
+    return registry
+
+
+def test_subject_pytest_config_is_ignored(fixture):
+    """A PR-controlled pytest config cannot change the check: addopts
+    (--collect-only) would make pytest exit 0 without running any test,
+    yet the hardened executor ignores the subject config entirely, so the
+    approved test actually runs and the junitxml evidence verifies it."""
+    subject, registry, event, claim, make_event, fake, sha, tmp = fixture
+    (subject / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\naddopts = \"--collect-only\"\n")
+    registry.write_text(json.dumps({"schema_version": 1, "checks": {
+        "pytest-regression": {"argv": ["python3", "-m", "pytest", "-v", "--noconftest",
+                                       "tests/test_approved.py::test_kept"],
+                              "timeout_seconds": 60, "regression_for": ["bug.fault"],
+                              "protected_paths": ["tests/test_approved.py"]}}}))
+    claim["checks"] = ["pytest-regression"]
+    make_event(claim)
+    p, report, out = audit(fixture)
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert report["decision"] == "PASS_VERIFIED"
+    res = report["check_results"][0]
+    assert res["evidence_verified"] is True
+    assert res["evidence_summary"]["tests"] == 1
+    assert res["evidence_summary"]["nodes_verified"] == ["tests.test_approved::test_kept"]
+    assert res["junitxml_file"].endswith(".xml")
+    assert "-c" in res["approved_argv"] and "/dev/null" in res["approved_argv"]
+    assert "--junitxml" in res["approved_argv"]
+
+
+def test_subject_startup_hook_is_not_executed(tmp_path):
+    """A sitecustomize.py in the subject root must not run during the
+    check: the executor launches pytest from a trusted temp dir, so the
+    subject root is never on sys.path at interpreter startup."""
+    subject = tmp_path / "subject"
+    (subject / "tests").mkdir(parents=True)
+    (subject / "tests" / "test_approved.py").write_text("def test_kept():\n    assert True\n")
+    (subject / "sitecustomize.py").write_text(
+        "from pathlib import Path\nPath(\"STARTUP_HOOK_RAN\").write_text(\"ran\\n\")\n")
+    registry = _pytest_registry(tmp_path)
+    result = tmp_path / "out" / "pytest-regression.json"
+    cmd = [sys.executable, str(SCRIPT), "check", "--subject", str(subject),
+           "--registry", str(registry), "--check-id", "pytest-regression",
+           "--result", str(result)]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    res = json.loads(result.read_text())
+    assert res["evidence_verified"] is True
+    assert res["exit_code"] == 0
+    assert not (subject / "STARTUP_HOOK_RAN").exists()
+    # Control: the probe is live — a plain interpreter started in the
+    # subject with the subject on sys.path DOES execute the hook.
+    env = dict(__import__("os").environ)
+    env["PYTHONPATH"] = str(subject)
+    subprocess.run([sys.executable, "-c", "pass"], cwd=subject, env=env,
+                   capture_output=True, timeout=30, check=True)
+    assert (subject / "STARTUP_HOOK_RAN").exists()
+
+
+def test_unapproved_pytest_argument_fails_closed(tmp_path):
+    """A registry argv that tries to add a plugin or config override is
+    rejected by the executor's allowlist instead of being executed."""
+    subject = tmp_path / "subject"
+    (subject / "tests").mkdir(parents=True)
+    (subject / "tests" / "test_approved.py").write_text("def test_kept():\n    assert True\n")
+    registry = tmp_path / "trusted" / "gateway" / "checks.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"schema_version": 1, "checks": {
+        "bad-plugin": {"argv": ["python3", "-m", "pytest", "-p", "some_plugin",
+                                "tests/test_approved.py::test_kept"],
+                       "timeout_seconds": 60, "regression_for": ["bug.fault"]}}}))
+    result = tmp_path / "out" / "bad-plugin.json"
+    cmd = [sys.executable, str(SCRIPT), "check", "--subject", str(subject),
+           "--registry", str(registry), "--check-id", "bad-plugin",
+           "--result", str(result)]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert p.returncode != 0
+    res = json.loads(result.read_text())
+    assert res["evidence_verified"] is False
+    assert res["exit_code"] == 127
+    assert "Unapproved pytest argument" in res["evidence_error"]
+
+
+def _junitxml(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_text(text)
+    return path
+
+
+def test_verify_junitxml_accepts_real_pass(tmp_path):
+    xml = _junitxml(tmp_path, "ok.xml", """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="0.1">
+<testcase classname="tests.test_approved" name="test_kept" time="0.01" />
+</testsuite></testsuites>""")
+    ok, summary, error = RG._verify_junitxml(xml, ["tests/test_approved.py::test_kept"])
+    assert ok is True and error == ""
+    assert summary["tests"] == 1 and summary["failures"] == 0
+    assert summary["nodes_verified"] == ["tests.test_approved::test_kept"]
+
+
+def test_verify_junitxml_rejects_failure_missing_and_malformed(tmp_path):
+    failing = _junitxml(tmp_path, "fail.xml", """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.1">
+<testcase classname="tests.test_approved" name="test_kept" time="0.01"><failure message="assert">x</failure></testcase>
+</testsuite></testsuites>""")
+    ok, _, error = RG._verify_junitxml(failing, ["tests/test_approved.py::test_kept"])
+    assert ok is False and "failures" in error
+    missing = _junitxml(tmp_path, "missing.xml", """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="0.1">
+<testcase classname="tests.test_approved" name="test_other" time="0.01" />
+</testsuite></testsuites>""")
+    ok, _, error = RG._verify_junitxml(missing, ["tests/test_approved.py::test_kept"])
+    assert ok is False and "no testcase" in error
+    empty = _junitxml(tmp_path, "empty.xml", """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" time="0.0">
+</testsuite></testsuites>""")
+    ok, _, error = RG._verify_junitxml(empty, [])
+    assert ok is False and "no tests ran" in error
+    bad = _junitxml(tmp_path, "bad.xml", "not xml at all")
+    ok, _, error = RG._verify_junitxml(bad, ["tests/test_approved.py::test_kept"])
+    assert ok is False and "unparsable" in error
+    ok, _, error = RG._verify_junitxml(tmp_path / "does-not-exist.xml",
+                                        ["tests/test_approved.py::test_kept"])
+    assert ok is False and "missing" in error
+
+
+def test_verify_junitxml_accepts_full_suite(tmp_path):
+    xml = _junitxml(tmp_path, "suite.xml", """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="1" tests="3" time="0.2">
+<testcase classname="tests.test_a" name="test_one" time="0.01" />
+<testcase classname="tests.test_a" name="test_two" time="0.01" />
+<testcase classname="tests.test_a" name="test_three" time="0.01"><skipped /></testcase>
+</testsuite></testsuites>""")
+    ok, summary, error = RG._verify_junitxml(xml, [])
+    assert ok is True and error == ""
+    assert summary["tests"] == 3 and summary["skipped"] == 1

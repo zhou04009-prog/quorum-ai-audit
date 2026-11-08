@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from typing import Any
 
 SCHEMA = 1
@@ -28,6 +29,105 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 MAX_BODY = 32_000
 # A deliberately narrow, code-reviewed list. Workflow/config/code/test changes NEVER skip.
 DOC_PATH = re.compile(r"(?:README\.md|(?:docs|examples)/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.md)\Z")
+# A pytest test target: a relative .py path (no traversal, no leading dash)
+# plus optional :: segments (class / test / parametrize id).
+NODE_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_./-]*\.py(::[A-Za-z0-9_.\[\]-]+)*$")
+
+
+def _node_parts(node: str) -> tuple[str, str]:
+    """Map a node id to the (classname, test name) pair junitxml uses."""
+    parts = node.split("::")
+    classname = parts[0][:-3].replace("/", ".")
+    if len(parts) > 2:
+        classname += "." + ".".join(parts[1:-1])
+    return classname, parts[-1].split("[", 1)[0]
+
+
+def _abs_node(subject: Path, node: str) -> str:
+    """Resolve a registry node id to an absolute path (file part only)."""
+    parts = node.split("::")
+    return str(subject / parts[0]) + ("::" + "::".join(parts[1:]) if len(parts) > 1 else "")
+
+
+def _parse_pytest_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Extract only test targets from a trusted-registry pytest argv.
+
+    The executor rebuilds the command from a fixed trusted template, so a
+    registry entry can never smuggle in a plugin (`-p`), a config override
+    (`-c`, `-o`, `--override-ini`, `--rootdir`), a different import mode, or
+    any other pytest flag. Only verbosity, --noconftest, --deselect and
+    test node ids survive; anything else fails closed."""
+    require(argv[:3] == ["python3", "-m", "pytest"],
+            "Pytest check must use the approved python3 -m pytest form")
+    nodes, deselects = [], []
+    i = 3
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-q", "-v", "--noconftest"):
+            i += 1
+        elif a == "--deselect":
+            require(i + 1 < len(argv) and NODE_RE.fullmatch(argv[i + 1])
+                    and ".." not in Path(argv[i + 1]).parts,
+                    "Invalid --deselect target in trusted registry")
+            deselects.append(argv[i + 1])
+            i += 2
+        elif NODE_RE.fullmatch(a) and ".." not in Path(a).parts:
+            nodes.append(a)
+            i += 1
+        else:
+            raise IntakeError(f"Unapproved pytest argument in trusted registry: {a[:80]}")
+    return nodes, deselects
+
+
+def _verify_junitxml(xml_path: Path, nodes: list[str]) -> tuple[bool, dict[str, Any], str]:
+    """Verify structured pytest evidence.
+
+    The XML must exist, parse, and show every expected node actually ran
+    and passed (no failure/error/skipped child), with zero failures/errors
+    in the whole run. Returns (ok, summary, error). Output text is never
+    consulted: a PR-controlled plugin can print any string it likes."""
+    summary: dict[str, Any] = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    if not xml_path.is_file():
+        return False, summary, "junitxml evidence file missing"
+    try:
+        root = ET.parse(xml_path).getroot()
+    except ET.ParseError as exc:
+        return False, summary, f"junitxml evidence unparsable: {exc}"
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    cases = []
+    for suite in suites:
+        for attr in ("tests", "failures", "errors", "skipped"):
+            try:
+                summary[attr] += int(suite.get(attr, "0"))
+            except ValueError:
+                return False, summary, f"junitxml testsuite has non-numeric {attr}"
+        cases.extend(suite.findall("testcase"))
+    if summary["failures"] or summary["errors"]:
+        return False, summary, "junitxml reports failures or errors"
+    if nodes:
+        found = []
+        for node in nodes:
+            classname, name = _node_parts(node)
+            hit = None
+            for case in cases:
+                if case.get("classname") != classname:
+                    continue
+                cname = case.get("name", "")
+                if cname == name or cname.startswith(name + "["):
+                    hit = case
+                    break
+            if hit is None:
+                return False, summary, f"junitxml has no testcase for node: {classname}::{name}"
+            if (hit.find("failure") is not None or hit.find("error") is not None
+                    or hit.find("skipped") is not None):
+                return False, summary, f"junitxml shows node did not pass: {classname}::{name}"
+            found.append(f"{classname}::{name}")
+        summary["nodes_verified"] = found
+        if summary["tests"] < len(nodes):
+            return False, summary, "junitxml reports fewer tests than expected nodes"
+    elif summary["tests"] < 1:
+        return False, summary, "junitxml reports no tests ran"
+    return True, summary, ""
 
 
 class IntakeError(ValueError):
@@ -174,8 +274,97 @@ def docs_only_changes(subject: Path, base: Path, github_base_sha: str) -> list[s
     return changed
 
 
+def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) -> dict[str, Any]:
+    """Run a trusted-registry pytest check through the hardened executor.
+
+    Trust boundary (v2, 2026-11-08 — replaces the F1 output-string check,
+    which a PR-controlled pytest config could forge via a plugin):
+    - The subject's pytest config is never read: `-c /dev/null` plus
+      `-o addopts=` means no pyproject.toml / pytest.ini / setup.cfg /
+      tox.ini in the PR tree can add options or load plugins.
+    - No conftest.py (`--noconftest`) and no plugin other than the cache
+      provider disable (`-p no:cacheprovider`); the registry argv is parsed
+      through a strict allowlist and the command is rebuilt from a fixed
+      template, so a registry entry can never smuggle in another flag.
+    - Python startup hooks in the subject tree cannot run: pytest is
+      launched with a trusted temp dir as cwd and PYTHONPATH, so the
+      subject root is never on sys.path at interpreter startup (site would
+      otherwise execute its sitecustomize.py / .pth files). The package
+      under test is exposed only through a symlink in that trusted dir,
+      and --rootdir pins pytest's own root to the subject.
+    - Evidence is structured, not a string: pytest writes a junitxml
+      report, which this trusted code parses and verifies (the expected
+      node actually ran and passed). A forged pass string in the log is
+      worthless on its own.
+    Returns the check outcome fields for the result JSON."""
+    nodes, deselects = _parse_pytest_argv(spec["argv"])
+    xml_path = result_path.with_suffix(".xml")
+    shim_dir = Path(tempfile.mkdtemp(prefix="trusted-pytest-shim-"))
+    outcome: dict[str, Any] = {"exit_code": 1, "timed_out": False, "out": "", "err": "",
+                               "evidence_verified": False, "evidence_summary": {},
+                               "evidence_error": "", "executed_argv": []}
+    try:
+        pkg = subject / "quorum"
+        if pkg.is_dir():
+            (shim_dir / "quorum").symlink_to(pkg, target_is_directory=True)
+        cmd = ["python3", "-m", "pytest", "-c", "/dev/null", "-o", "addopts=",
+               "--noconftest", "-p", "no:cacheprovider",
+               "--junitxml", str(xml_path), "--rootdir", str(subject)]
+        cmd.append("-v" if nodes else "-q")
+        # --deselect takes a node id, matched against the collected tests'
+        # rootdir-relative ids: it must stay in the registry's relative
+        # form. (An absolute path here does not match, so the deselected
+        # test would run — in the read-only container it would then fail
+        # for writing inside the repo, breaking the all-unit check.)
+        for d in deselects:
+            cmd += ["--deselect", d]
+        # With no node target (full-suite check) pytest must be told where
+        # to collect: it defaults to the cwd, which here is the trusted
+        # shim dir, not the subject. Passing the subject as the collection
+        # root replicates the old cwd=subject behaviour.
+        cmd += [_abs_node(subject, n) for n in nodes] if nodes else [str(subject)]
+        outcome["executed_argv"] = cmd
+        env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
+        env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+                    "PYTHONPATH": str(shim_dir)})
+        try:
+            proc = subprocess.run(cmd, cwd=shim_dir, env=env, text=True,
+                                  capture_output=True,
+                                  timeout=int(spec.get("timeout_seconds", 120)),
+                                  check=False, errors="replace")
+            outcome["exit_code"], outcome["out"], outcome["err"] = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            outcome["timed_out"] = True
+            outcome["exit_code"] = 124
+            outcome["out"] = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            outcome["err"] = "TIMEOUT: approved check exceeded timeout"
+        except (OSError, ValueError) as exc:
+            outcome["err"] = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
+            outcome["exit_code"] = 127
+        ok, summary, error = _verify_junitxml(xml_path, nodes)
+        outcome["evidence_summary"] = summary
+        outcome["evidence_error"] = error
+        # Evidence is only meaningful when the command itself exited 0; a
+        # non-zero exit is already a failed check (FAIL_REPRODUCED).
+        outcome["evidence_verified"] = bool(outcome["exit_code"] == 0 and ok)
+        if xml_path.is_file():
+            outcome["junitxml_sha256"] = digest(xml_path.read_bytes())
+            outcome["junitxml_file"] = xml_path.name
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
+    return outcome
+
+
 def cmd_check(a: argparse.Namespace) -> int:
-    """Trusted wrapper invoked by quorum verify via a generated ledger check."""
+    """Trusted wrapper invoked by quorum verify via a generated ledger check.
+
+    Pytest checks run through the hardened trusted executor
+    (_run_pytest_check): the subject's pytest config, conftest and Python
+    startup hooks are all neutralised, and the pass verdict rests on a
+    parsed junitxml report, never on output strings (v2, 2026-11-08).
+    Non-pytest approved commands run verbatim as before: they come from
+    the trusted registry, have no test-run concept, and their exit code
+    is their own evidence. The production registry is pytest-only."""
     subject = Path(a.subject).resolve()
     result_path = Path(a.result).resolve()
     registry = load_registry(Path(a.registry).resolve())
@@ -183,52 +372,68 @@ def cmd_check(a: argparse.Namespace) -> int:
     require(check_id in registry, "Unknown check")
     spec = registry[check_id]
     out = ""; err = ""; code = 1; timed_out = False
-    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
-    env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(subject)})
-    t0 = dt.datetime.now(dt.timezone.utc)
-    try:
-        proc = subprocess.run(spec["argv"], cwd=subject, env=env, text=True,
-                              capture_output=True, timeout=int(spec.get("timeout_seconds", 120)), check=False,
-                              errors="replace")
-        code, out, err = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True; code = 124
-        out = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = "TIMEOUT: approved check exceeded timeout"
-    except (OSError, ValueError) as exc:
-        err = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
-        code = 127
-    # Evidence-of-execution (P0, 2026-11-08): an exit code of 0 is only
-    # trustworthy if a test actually ran. A conftest.py — or import-time code
-    # in the subject tree — that calls os._exit(0) produces an empty log with
-    # exit 0; without this check the gate would record a PASS for a repair
-    # that was never tested. This applies to pytest checks only: a non-pytest
-    # approved command has no test-run concept, and its exit code is its own
-    # evidence. Node-targeted checks must show the node id (-v) or a passing
-    # summary (-q); the full-suite check must show a passing-test summary.
     evidence_verified = True
-    if code == 0 and "pytest" in spec["argv"]:
-        combined = out + "\n" + err
-        node = next((a for a in spec["argv"] if "::" in a), None)
-        if node is not None:
-            if node not in combined and " passed" not in combined:
-                evidence_verified = False
-                err = f"CHECK_EVIDENCE_MISSING: targeted test node did not run: {node}"
-        elif " passed" not in combined:
-            evidence_verified = False
-            err = "CHECK_EVIDENCE_MISSING: no passing-test summary in log"
-        if not evidence_verified:
-            code = 1
+    evidence_summary: dict[str, Any] = {}
+    evidence_error = ""
+    executed_argv: list[str] = list(spec["argv"])
+    junitxml_sha256 = None
+    junitxml_file = None
+    t0 = dt.datetime.now(dt.timezone.utc)
+    if "pytest" in spec["argv"]:
+        try:
+            outcome = _run_pytest_check(subject, spec, result_path)
+        except IntakeError as exc:
+            # Unapproved registry content fails closed, with a result JSON.
+            outcome = {"exit_code": 127, "timed_out": False, "out": "",
+                       "err": f"CHECK_CONFIG_ERROR: {exc}", "evidence_verified": False,
+                       "evidence_summary": {}, "evidence_error": str(exc),
+                       "executed_argv": []}
+        code, out, err = outcome["exit_code"], outcome["out"], outcome["err"]
+        timed_out = outcome["timed_out"]
+        evidence_verified = outcome["evidence_verified"]
+        evidence_summary = outcome["evidence_summary"]
+        evidence_error = outcome["evidence_error"]
+        executed_argv = outcome["executed_argv"]
+        junitxml_sha256 = outcome.get("junitxml_sha256")
+        junitxml_file = outcome.get("junitxml_file")
+        if not evidence_verified and code == 0:
+            # The command exited 0 but produced no trustworthy evidence
+            # that a test ran. Do not override the exit code: the audit
+            # distinguishes this (EVIDENCE_MISSING) from a reproduced
+            # regression (FAIL_REPRODUCED) via evidence_verified.
+            err = f"CHECK_EVIDENCE_MISSING: {evidence_error}" if evidence_error else "CHECK_EVIDENCE_MISSING"
+    else:
+        env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
+        env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(subject)})
+        try:
+            proc = subprocess.run(spec["argv"], cwd=subject, env=env, text=True,
+                                  capture_output=True, timeout=int(spec.get("timeout_seconds", 120)), check=False,
+                                  errors="replace")
+            code, out, err = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True; code = 124
+            out = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err = "TIMEOUT: approved check exceeded timeout"
+        except (OSError, ValueError) as exc:
+            err = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
+            code = 127
     # Bound collected bytes; no credential environment variables passed to the check.
     log = ("STDOUT:\n" + out + "\nSTDERR:\n" + err)[-65_536:]
     log_path = result_path.with_suffix(".log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(log, encoding="utf-8")
-    write_json(result_path, {"check_id": check_id, "approved_argv": spec["argv"],
-                             "exit_code": code, "timed_out": timed_out,
-                             "evidence_verified": evidence_verified,
-                             "duration_seconds": round((dt.datetime.now(dt.timezone.utc)-t0).total_seconds(), 3),
-                             "log_sha256": digest(log.encode("utf-8")), "log_file": log_path.name})
+    result: dict[str, Any] = {"check_id": check_id, "approved_argv": executed_argv,
+                              "registry_argv": spec["argv"],
+                              "exit_code": code, "timed_out": timed_out,
+                              "evidence_verified": evidence_verified,
+                              "evidence_summary": evidence_summary,
+                              "evidence_error": evidence_error,
+                              "duration_seconds": round((dt.datetime.now(dt.timezone.utc)-t0).total_seconds(), 3),
+                              "log_sha256": digest(log.encode("utf-8")), "log_file": log_path.name}
+    if junitxml_sha256 is not None:
+        result["junitxml_sha256"] = junitxml_sha256
+        result["junitxml_file"] = junitxml_file
+    write_json(result_path, result)
     print(f"APPROVED_CHECK id={check_id} exit={code} evidence={result_path} log_sha256={digest(log.encode('utf-8'))}")
     if code != 0:
         print(log[-1200:], file=sys.stderr)
@@ -319,6 +524,13 @@ def cmd_audit(a: argparse.Namespace) -> int:
             summary["error"]="At least one approved check did not produce evidence"
         elif any(r["exit_code"] != 0 for r in results):
             summary["decision"]="FAIL_REPRODUCED"
+        elif any(r.get("evidence_verified") is not True for r in results):
+            # A check exited 0 but produced no verifiable structured
+            # evidence that its test ran and passed (v2, 2026-11-08).
+            # This is a missing-evidence outcome, not a reproduced
+            # regression: the repair is unverified, and the merge is blocked.
+            summary["decision"]="EVIDENCE_MISSING"
+            summary["error"]="At least one approved check produced no verifiable test evidence"
         elif p.returncode == 0:
             summary["decision"]="PASS_VERIFIED"
         else:
