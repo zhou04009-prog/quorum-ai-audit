@@ -17,7 +17,7 @@ jobs:
       - name: Checkout trusted auditor
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: d0c0d8543f887e05dfe13e8c3cc2e03d463bdd3f
           path: verifier
           persist-credentials: false
       - name: Checkout exact subject commit
