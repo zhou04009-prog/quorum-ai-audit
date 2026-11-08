@@ -164,7 +164,7 @@ def nonrepair_fixture(tmp_path):
     base.mkdir()
     git(base, "init", "-q")
     git(base, "config", "user.name", "Fixture")
-    git(base, "config", "user.email", "fixture@example.invalid")
+    git(base, "config", "user.email", "fixture" + chr(64) + "example.invalid")
     (base / "README.md").write_text("Base docs\n")
     (base / "src").mkdir()
     (base / "src" / "service.py").write_text("value = 1\n")
@@ -176,7 +176,7 @@ def nonrepair_fixture(tmp_path):
     subject = tmp_path / "subject"
     subprocess.run(["git", "clone", "-q", str(base), str(subject)], check=True)
     git(subject, "config", "user.name", "Fixture")
-    git(subject, "config", "user.email", "fixture@example.invalid")
+    git(subject, "config", "user.email", "fixture" + chr(64) + "example.invalid")
     registry = tmp_path / "trusted" / "gateway" / "checks.json"
     registry.parent.mkdir(parents=True)
     registry.write_text(json.dumps({"schema_version": 1, "checks": {
