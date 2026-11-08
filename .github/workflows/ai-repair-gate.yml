@@ -29,6 +29,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           path: subject
+          persist-credentials: false     
+      - name: Checkout exact base commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -40,6 +47,7 @@ jobs:
           python verifier/gateway/repair_gateway.py audit \
             --event "$GITHUB_EVENT_PATH" \
             --subject "$GITHUB_WORKSPACE/subject" \
+            --base "$GITHUB_WORKSPACE/base" \
             --registry "$GITHUB_WORKSPACE/verifier/gateway/checks.json" \
             --out "$GITHUB_WORKSPACE/audit-evidence"
       - name: Preserve independent evidence even on failure
