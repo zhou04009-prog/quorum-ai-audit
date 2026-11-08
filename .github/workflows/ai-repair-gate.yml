@@ -2,7 +2,7 @@ name: ai-repair-quorum-gate
 on:
   pull_request:
     branches:
-      - feat/cross-ai-repair-gateway
+      - main
     types: [opened, synchronize, reopened, edited]
 
 # Pull request text is untrusted. Never use pull_request_target here.
