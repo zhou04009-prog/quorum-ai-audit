@@ -33,3 +33,6 @@ Artifacts: `audit-evidence/summary.json`, `ledger.md`, `verify.json`, `quorum.lo
 - Preserve the repository's existing `ci.yml` and `reviews/review.yaml` unchanged.
 
 **Regression-test integrity:** Registry entries may designate `protected_paths` (for example `tests/test_quorum.py`); if the PR alters these trusted regression tests relative to the reviewed base snapshot, intake fails closed. Tests run against PR code, but Quorum CLI runs with `PYTHONPATH` forced to the trusted verifier tree. Other package dependencies in the PR may still execute untrusted code in the runner.
+## Development-only positive acceptance control
+
+This positive-control PR verifies the existing correct ledger behavior using independent trusted regression checks. It does not introduce a new production repair or modify protected regression tests.
