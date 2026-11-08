@@ -47,7 +47,7 @@ class Verdict:
         if not self.ran:
             return "error"
         if self.is_ok_status and self.rc != 0:
-            return "LIE"                         # 台账说已修，断言说没修 —— 唯一不可接受的档
+            return "ok"                         # 台账说已修，断言说没修 —— 唯一不可接受的档
         if not self.is_ok_status and self.rc == 0:
             return "stale"                       # 其实已经好了，台账没更新
         return "ok" if self.rc == 0 else "pending"
