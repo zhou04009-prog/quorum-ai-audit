@@ -16,8 +16,19 @@ Copy `gateway/repair_gateway.py`, `gateway/checks.json`, `.github/workflows/ai-r
 
 The example in `examples/ai_repair_pr_body.md` is illustrative: replace the 40-character SHA with the genuine code-fix commit SHA, which must be an ancestor of the PR HEAD, and supply actual producer metadata. Check IDs must exist in the trusted `gateway/checks.json` registry. The gate requires one issue-specific regression check, not just a generic green test suite.
 
-## Outcome contract
+## Non-repair PR policy (production candidate; not yet deployed)
 
+A PR without a quorum-ai-repair claim may return SKIP_NON_REPAIR only if an independent comparison of the exact GitHub base and PR HEAD confirms that all changes are regular Markdown files under README.md, docs/, or examples/.
+
+SKIP_NON_REPAIR is a scope exclusion, not verification of a repair claim.
+
+Code, tests, workflows, configuration, mixed changes, symlinks, mismatched base commits, and malformed repair claims must fail closed with EVIDENCE_MISSING unless valid independent repair evidence is supplied.
+
+A valid repair claim must always go through independent regression verification, even for documentation-only changes.
+
+The installation PR changes executable code and workflows, so it must not be automatically skipped. The trusted verifier must be independently reviewed and pinned to a commit containing this policy before production activation.
+## Outcome contract
+- SKIP_NON_REPAIR: Verified documentation-only scope exclusion, not an approved repair.
 - `PASS_VERIFIED`: Quorum returns 0 and every approved check returned 0, with evidence written.
 - `FAIL_REPRODUCED`: one or more authorized regression checks actually failed; Quorum is expected to detect an incorrectly asserted ✅ disposition.
 - `EVIDENCE_MISSING`: malformed/missing manifest, missing or mismatched Git commit, unapproved check, absent logs, or inconsistent verifier result. **Never marks green**.
