@@ -399,3 +399,5 @@ MIT
 ## Universal AI Audit CI Test
 
 Initial GitHub Actions verification.
+
+<!-- production gate verification drill: docs-only change -->
