@@ -26,6 +26,8 @@ SLUG = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 ISSUE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 MAX_BODY = 32_000
+# A deliberately narrow, code-reviewed list. Workflow/config/code/test changes NEVER skip.
+DOC_PATH = re.compile(r"(?:README\.md|(?:docs|examples)/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.md)\Z")
 
 
 class IntakeError(ValueError):
@@ -114,17 +116,62 @@ def parse_event(event_file: Path) -> tuple[dict[str, Any], list[Any]]:
     body = event["pull_request"].get("body") or ""
     require(isinstance(body, str) and len(body) <= MAX_BODY, "PR body is missing or too large")
     matches = MARKER.findall(body)
-    require(len(matches) == 1, "PR body must contain exactly one <!-- quorum-ai-repair ... --> block")
-    parsed = json.loads(matches[0]); claims = parsed if isinstance(parsed, list) else [parsed]
-    require(1 <= len(claims) <= 10, "Accept 1 to 10 claims per PR")
+    # A malformed or multiply-declared claim must never fall into the docs-only path.
+    require(len(matches) == 1 or (not matches and "quorum-ai-repair" not in body.lower()),
+            "PR body must contain exactly one valid <!-- quorum-ai-repair ... --> block")
+    claims = []
+    if matches:
+        parsed = json.loads(matches[0]); claims = parsed if isinstance(parsed, list) else [parsed]
+        require(1 <= len(claims) <= 10, "Accept 1 to 10 claims per PR")
     head_sha = event["pull_request"].get("head", {}).get("sha", "")
     require(isinstance(head_sha, str) and SHA.fullmatch(head_sha), "PR head SHA missing")
     repo = event.get("repository", {}).get("full_name", "")
     require(isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo), "GitHub repository missing")
+    base_sha = event["pull_request"].get("base", {}).get("sha", "")
     metadata = {"github_repository": repo, "github_pr_number": event["pull_request"].get("number"),
                 "github_pr_url": event["pull_request"].get("html_url"), "github_head_sha": head_sha,
-                "github_event_sha256": digest(event_file.read_bytes())}
+                "github_base_sha": base_sha, "github_event_sha256": digest(event_file.read_bytes())}
     return metadata, claims
+
+
+
+def tracked_tree(root: Path) -> dict[str, tuple[str, str]]:
+    """Read *committed* Git tree data without executing anything from PR content."""
+    proc = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "-z", "HEAD"],
+                          capture_output=True, timeout=15, check=False)
+    require(proc.returncode == 0, "Unable to inspect committed Git tree")
+    result = {}
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            metadata, name = entry.split(b"\t", 1)
+            mode, obj_type, oid = metadata.split(b" ")
+            path = name.decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise IntakeError("Unrecognized committed Git tree entry") from exc
+        require(obj_type == b"blob", "Unexpected Git tree object type")
+        result[path] = mode.decode("ascii"), oid.decode("ascii")
+    return result
+
+
+def docs_only_changes(subject: Path, base: Path, github_base_sha: str) -> list[str]:
+    """Compare exact base and PR-HEAD trees; no untrusted labels or self-declarations."""
+    require(bool(SHA.fullmatch(github_base_sha)), "GitHub base SHA missing")
+    base_head = git(base, "rev-parse", "HEAD")
+    require(base_head.returncode == 0 and base_head.stdout.strip() == github_base_sha,
+            "Checked-out base SHA does not match GitHub PR event")
+    before, after = tracked_tree(base), tracked_tree(subject)
+    changed = sorted(path for path in before.keys() | after.keys()
+                     if before.get(path) != after.get(path))
+    require(bool(changed), "No committed file changes in PR")
+    for path in changed:
+        require(bool(DOC_PATH.fullmatch(path)),
+                f"Repair claim required for non-documentation file: {path[:150]}")
+        for meta in (before.get(path), after.get(path)):
+            require(meta is None or meta[0] == "100644",
+                    f"Non-regular documentation file forbidden: {path[:150]}")
+    return changed
 
 
 def cmd_check(a: argparse.Namespace) -> int:
@@ -181,6 +228,14 @@ def cmd_audit(a: argparse.Namespace) -> int:
         repo_head = git(subject, "rev-parse", "HEAD")
         require(repo_head.returncode == 0 and repo_head.stdout.strip() == metadata["github_head_sha"],
                 "Checked-out code SHA does not match GitHub PR event")
+        if not raw_claims:
+            require(bool(a.base), "Missing exact base checkout for non-repair classification")
+            summary["changed_files"] = docs_only_changes(subject, Path(a.base).resolve(),
+                                                          metadata["github_base_sha"])
+            summary["decision"] = "SKIP_NON_REPAIR"
+            summary["audit_scope"] = "STRICT_DOCS_ONLY"
+            # This is a successful *scope exclusion*, never an accepted repair claim.
+            return 0
         require(len(raw_claims) <= 10, "Too many claims")
         accepted = [validate_claim(c, checks, subject, metadata["github_head_sha"], trusted_root) for c in raw_claims]
         ids = [x["claim_id"] for x in accepted]
@@ -256,6 +311,7 @@ def main(argv: list[str] | None=None) -> int:
     audit=sub.add_parser("audit")
     for key in ("event","subject","registry","out"):
         audit.add_argument("--"+key,required=True)
+    audit.add_argument("--base", default=None, help="Exact checkout of GitHub PR base SHA")
     audit.add_argument("--quorum-bin",default="quorum")
     audit.add_argument("--quorum-timeout",type=int,default=900)
     audit.set_defaults(func=cmd_audit)
