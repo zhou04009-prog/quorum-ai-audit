@@ -1,0 +1,58 @@
+name: DEV-ONLY Cross-AI Negative PR Acceptance
+
+on:
+  pull_request:
+    branches:
+      - feat/cross-ai-repair-gateway
+    types: [opened, reopened, synchronize, edited]
+
+# This workflow is only for the isolated feature-branch acceptance drill.
+# It must not be merged to main. No write permissions or secrets.
+permissions:
+  contents: read
+
+jobs:
+  dev-negative-pr-audit:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout independent, pinned, green verifier
+        uses: actions/checkout@v4
+        with:
+          ref: d0c0d8543f887e05dfe13e8c3cc2e03d463bdd3f
+          path: verifier
+          persist-credentials: false
+
+      - name: Checkout exact untrusted PR HEAD
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          path: subject
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install independent trusted Quorum
+        run: python -m pip install -e './verifier[dev]'
+
+      - name: Audit negative repair claim against trusted regression test
+        run: |
+          python verifier/gateway/repair_gateway.py audit \
+            --event "$GITHUB_EVENT_PATH" \
+            --subject "$GITHUB_WORKSPACE/subject" \
+            --registry "$GITHUB_WORKSPACE/verifier/gateway/checks.json" \
+            --out "$GITHUB_WORKSPACE/audit-evidence"
+
+      - name: Upload audit evidence including expected rejections
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-negative-evidence-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: audit-evidence/
+          if-no-files-found: warn
+          retention-days: 30
