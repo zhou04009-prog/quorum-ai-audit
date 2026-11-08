@@ -54,7 +54,9 @@ jobs:
           cat > "$RUNNER_TEMP/quorum-gateway.Dockerfile" <<'DOCKERFILE'
           FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
           RUN apt-get update && apt-get install -y --no-install-recommends git \
-              && rm -rf /var/lib/apt/lists/*
+              && rm -rf /var/lib/apt/lists/* \
+              && echo 'runner:x:1001:1001:GitHub Actions runner:/tmp:/usr/sbin/nologin' >> /etc/passwd \
+              && git config --system --add safe.directory /trusted
           COPY . /trusted
           RUN python -m pip install --no-cache-dir -e '/trusted[dev]'
           WORKDIR /subject
@@ -73,9 +75,9 @@ jobs:
           docker run --rm \
             --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges \
-            --memory 2g --pids-limit 256 \
+            --memory 2g --memory-swap=2g --pids-limit 256 \
             --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,size=256m \
+            --tmpfs /tmp:rw,nosuid,exec,size=256m \
             --mount "type=bind,src=$GITHUB_EVENT_PATH,dst=/event.json,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE/subject,dst=/subject,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE/base,dst=/base,readonly" \

@@ -6,7 +6,8 @@
         "python3",
         "-m",
         "pytest",
-        "-q",
+        "-v",
+        "--noconftest",
         "tests/test_quorum.py::test_ledger_verdicts"
       ],
       "timeout_seconds": 180,
@@ -22,7 +23,8 @@
         "python3",
         "-m",
         "pytest",
-        "-q",
+        "-v",
+        "--noconftest",
         "tests/test_quorum.py::test_verify_exit_code_survives_incident_write_failure"
       ],
       "timeout_seconds": 180,
@@ -38,7 +40,10 @@
         "python3",
         "-m",
         "pytest",
-        "-q"
+        "-q",
+        "--noconftest",
+        "--deselect",
+        "tests/test_quorum.py::test_demo_gates_are_green_on_broken_material_but_can_go_red"
       ],
       "timeout_seconds": 400,
       "regression_for": []

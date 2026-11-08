@@ -36,6 +36,7 @@ def test_untrusted_checkout_cannot_run_on_host():
 def test_sandbox_is_offline_and_credentials_not_forwarded():
     run=next(step['run'] for step in steps if step['name'].startswith('Independent audit'))
     for required in ['--network none','--read-only','--cap-drop ALL','--security-opt no-new-privileges',
+                     '--memory 2g','--memory-swap=2g','--pids-limit 256','exec,size=256m',
                      'dst=/subject,readonly','dst=/base,readonly','--env HOME=/tmp',
                      '--base /base','--registry /trusted/gateway/checks.json']:
         assert required in run,required

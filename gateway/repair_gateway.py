@@ -198,6 +198,27 @@ def cmd_check(a: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         err = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
         code = 127
+    # Evidence-of-execution (P0, 2026-11-08): an exit code of 0 is only
+    # trustworthy if a test actually ran. A conftest.py — or import-time code
+    # in the subject tree — that calls os._exit(0) produces an empty log with
+    # exit 0; without this check the gate would record a PASS for a repair
+    # that was never tested. This applies to pytest checks only: a non-pytest
+    # approved command has no test-run concept, and its exit code is its own
+    # evidence. Node-targeted checks must show the node id (-v) or a passing
+    # summary (-q); the full-suite check must show a passing-test summary.
+    evidence_verified = True
+    if code == 0 and "pytest" in spec["argv"]:
+        combined = out + "\n" + err
+        node = next((a for a in spec["argv"] if "::" in a), None)
+        if node is not None:
+            if node not in combined and " passed" not in combined:
+                evidence_verified = False
+                err = f"CHECK_EVIDENCE_MISSING: targeted test node did not run: {node}"
+        elif " passed" not in combined:
+            evidence_verified = False
+            err = "CHECK_EVIDENCE_MISSING: no passing-test summary in log"
+        if not evidence_verified:
+            code = 1
     # Bound collected bytes; no credential environment variables passed to the check.
     log = ("STDOUT:\n" + out + "\nSTDERR:\n" + err)[-65_536:]
     log_path = result_path.with_suffix(".log")
@@ -205,6 +226,7 @@ def cmd_check(a: argparse.Namespace) -> int:
     log_path.write_text(log, encoding="utf-8")
     write_json(result_path, {"check_id": check_id, "approved_argv": spec["argv"],
                              "exit_code": code, "timed_out": timed_out,
+                             "evidence_verified": evidence_verified,
                              "duration_seconds": round((dt.datetime.now(dt.timezone.utc)-t0).total_seconds(), 3),
                              "log_sha256": digest(log.encode("utf-8")), "log_file": log_path.name})
     print(f"APPROVED_CHECK id={check_id} exit={code} evidence={result_path} log_sha256={digest(log.encode('utf-8'))}")
@@ -265,7 +287,14 @@ def cmd_audit(a: argparse.Namespace) -> int:
                "channels":{"local":{"kind":"fake"}},
                "reviewers":[{"name":"local-checks", "channel":"local", "vendor":"independent-runner", "role":"primary"}]}
         config_file=outdir / "verify.json"; write_json(config_file,cfg)
-        qcmd = [a.quorum_bin, "verify", "--config", str(config_file), "--ledger", str(ledger_file), "--no-incidents", "--strict"]
+        # Timeout layering (P1-2, 2026-11-08): quorum verify's per-command
+        # timeout must exceed the registry's longest check timeout, so a hung
+        # check is killed by its own timeout (result JSON with timed_out=true
+        # -> FAIL_REPRODUCED) instead of quorum killing the ledger command
+        # first (no result JSON -> EVIDENCE_MISSING). Layering: check (<=400)
+        # < quorum per-command (600) < quorum overall (900) < job (1200).
+        q_cmd_timeout = max(int(s.get("timeout_seconds", 120)) for s in checks.values()) + 200
+        qcmd = [a.quorum_bin, "verify", "--config", str(config_file), "--ledger", str(ledger_file), "--no-incidents", "--strict", "--timeout", str(q_cmd_timeout)]
         # Trusted Quorum implementation must never be resolved from the AI's PR tree.
         trusted_env = dict(os.environ)
         trusted_env["PYTHONPATH"] = str(trusted_root)
