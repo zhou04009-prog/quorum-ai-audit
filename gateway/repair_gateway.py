@@ -167,7 +167,14 @@ def _verify_supervisor_events(events: list[dict[str, Any]], nodes: list[str],
             return False, summary, f"supervisor saw a duplicate test event for node {node!r} phase {phase!r}"
         seen_phase.add((node, phase))
         node_phases = by_node.setdefault(node, {})
-        # Phases for a node must arrive in setup -> call -> teardown order.
+        # Phases for a node must arrive in setup -> call -> teardown order,
+        # and each phase requires its predecessor: a call without a setup,
+        # or a teardown without a call, is not a sequence real pytest can
+        # produce (missing setup / missing teardown).
+        if phase == "call" and "setup" not in node_phases:
+            return False, summary, f"supervisor saw a call event for node {node!r} with no setup event (missing setup)"
+        if phase == "teardown" and "call" not in node_phases:
+            return False, summary, f"supervisor saw a teardown event for node {node!r} with no call event (missing call)"
         if node_phases:
             last_phase = max(node_phases, key=lambda p: phase_order[p])
             if phase_order[phase] <= phase_order[last_phase]:
@@ -183,6 +190,13 @@ def _verify_supervisor_events(events: list[dict[str, Any]], nodes: list[str],
                 summary["errors"] += 1
             elif outcome == "skipped":
                 summary["skipped"] += 1
+    # A passed call requires a teardown: real pytest always reports
+    # teardown for a test whose setup and call both completed. A passed
+    # call with no teardown means the session was interrupted after the
+    # call, or the events were forged incompletely.
+    for nid, phases in by_node.items():
+        if phases.get("call") == "passed" and "teardown" not in phases:
+            return False, summary, f"supervisor saw a passed call for node {nid!r} with no teardown event (missing teardown)"
     if nodes:
         found = []
         for node in nodes:

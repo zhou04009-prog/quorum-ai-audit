@@ -423,10 +423,30 @@ def test_unapproved_pytest_argument_fails_closed(tmp_path):
 
 
 def _sup_events(*evs):
-    """Build a supervisor event list: session_start + the given test events."""
+    """Build a supervisor event list: session_start + the given test events.
+
+    For each call event, auto-add a preceding setup (passed) and, for a
+    passed call, a following teardown (passed) unless already given for
+    that node, so the list is a well-formed session under the v4 strict
+    state machine. Tests that need a deliberately malformed sequence
+    build their event lists by hand instead."""
     out = [{"type": "session_start"}]
+    by_node: dict[str, dict[str, str]] = {}
+    order: list[str] = []
     for node, phase, outcome in evs:
-        out.append({"type": "test", "node": node, "phase": phase, "outcome": outcome})
+        if node not in by_node:
+            by_node[node] = {}
+            order.append(node)
+        by_node[node][phase] = outcome
+    for node in order:
+        phases = by_node[node]
+        if "setup" not in phases and "call" in phases:
+            out.append({"type": "test", "node": node, "phase": "setup", "outcome": "passed"})
+        for phase in ("setup", "call", "teardown"):
+            if phase in phases:
+                out.append({"type": "test", "node": node, "phase": phase, "outcome": phases[phase]})
+        if phases.get("call") == "passed" and "teardown" not in phases:
+            out.append({"type": "test", "node": node, "phase": "teardown", "outcome": "passed"})
     out.append({"type": "session_finish", "exitstatus": 0})
     return out
 
@@ -552,7 +572,7 @@ def test_verify_supervisor_rejects_duplicate_and_out_of_order_events(tmp_path):
            {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
            {"type": "session_finish", "exitstatus": 0}]
     ok, _, error = RG._verify_supervisor_events(ooo, [node])
-    assert ok is False and "out-of-order" in error
+    assert ok is False and ("out-of-order" in error or "missing setup" in error)
     # Teardown before call.
     ooo2 = [{"type": "session_start"},
             {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
@@ -560,7 +580,7 @@ def test_verify_supervisor_rejects_duplicate_and_out_of_order_events(tmp_path):
             {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
             {"type": "session_finish", "exitstatus": 0}]
     ok, _, error = RG._verify_supervisor_events(ooo2, [node])
-    assert ok is False and "out-of-order" in error
+    assert ok is False and ("out-of-order" in error or "missing call" in error)
 
 
 def test_verify_supervisor_rejects_events_after_finish_and_bad_exitstatus(tmp_path):
@@ -649,3 +669,38 @@ def test_worker_cannot_read_supervisor_token(tmp_path):
     assert res["evidence_summary"]["tests"] == 1
     assert res["evidence_summary"]["session_finished"] is True
     assert res["evidence_summary"]["nodes_verified"] == ["tests.test_approved::test_kept"]
+
+
+def test_verify_supervisor_rejects_missing_setup_and_missing_teardown(tmp_path):
+    """v4 (supplement): a call without a setup, or a passed call without a
+    teardown, is rejected -- real pytest always reports setup before call
+    and teardown after a completed call."""
+    node = "tests/test_a.py::test_one"
+    # Call with no setup.
+    no_setup = [{"type": "session_start"},
+                {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
+                {"type": "test", "node": node, "phase": "teardown", "outcome": "passed"},
+                {"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(no_setup, [node])
+    assert ok is False and "missing setup" in error
+    # Teardown with no call.
+    no_call = [{"type": "session_start"},
+               {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+               {"type": "test", "node": node, "phase": "teardown", "outcome": "passed"},
+               {"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(no_call, [node])
+    assert ok is False and "missing call" in error
+    # Passed call with no teardown.
+    no_teardown = [{"type": "session_start"},
+                   {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+                   {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
+                   {"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(no_teardown, [node])
+    assert ok is False and "missing teardown" in error
+    # A setup-only failure (fixture error, no call, no teardown) is still
+    # rejected by the node check (call != passed), not by the phase rules.
+    setup_failed = [{"type": "session_start"},
+                    {"type": "test", "node": node, "phase": "setup", "outcome": "failed"},
+                    {"type": "session_finish", "exitstatus": 1}]
+    ok, _, error = RG._verify_supervisor_events(setup_failed, [node], exit_code=1)
+    assert ok is False
