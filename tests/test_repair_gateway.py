@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -454,11 +455,14 @@ def test_verify_supervisor_rejects_failure_missing_and_malformed(tmp_path):
     ok, _, error = RG._verify_supervisor_events([], ["tests/test_approved.py::test_kept"])
     assert ok is False and "session_start" in error
     # A test that only ever started (setup) but never ran its call phase.
+    # v4: the strict state machine rejects it for the missing
+    # session_finish (the session did not end normally), not for the
+    # missing call -- either way it is rejected fail-closed.
     started_only = [{"type": "session_start"},
                     {"type": "test", "node": "tests/test_approved.py::test_kept",
                      "phase": "setup", "outcome": "passed"}]
     ok, _, error = RG._verify_supervisor_events(started_only, ["tests/test_approved.py::test_kept"])
-    assert ok is False and "did not pass" in error
+    assert ok is False and ("did not pass" in error or "session_finish" in error)
     # Full suite: zero passed (all skipped) is rejected.
     all_skipped = _sup_events(("tests/test_a.py::test_one", "call", "skipped"),
                               ("tests/test_a.py::test_two", "call", "skipped"))
@@ -497,12 +501,151 @@ def test_forged_junitxml_and_early_exit_are_rejected(tmp_path):
            "--registry", str(registry), "--check-id", "pytest-regression",
            "--result", str(result)]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    assert p.returncode == 0, (p.stdout, p.stderr)
     res = json.loads(result.read_text())
-    # The process exited 0, but no supervised test event exists.
-    assert res["exit_code"] == 0
+    # v4 (xdist): the import-time os._exit(0) kills the WORKER during
+    # collection, so the controller's pytest exits non-zero (internal
+    # error) and cmd_check returns 1. Either way the forged XML must
+    # NOT produce a pass: no supervised test ran and evidence is false.
+    assert p.returncode == 1, (p.stdout, p.stderr)
+    assert res["exit_code"] != 0
     assert res["evidence_verified"] is False
     assert res["evidence_summary"]["tests"] == 0
-    assert "session_start" in res["evidence_error"] or "no test event" in res["evidence_error"]
 
 
+
+
+# ---------------------------------------------------------------------------
+# v4: strict supervisor state machine + trust-domain split (R7 fix)
+# ---------------------------------------------------------------------------
+
+def test_verify_supervisor_rejects_missing_session_finish(tmp_path):
+    """v4: a session that never finished normally is rejected, even if the
+    test events look like a pass (the audit finding: session_finished was
+    recorded but never required)."""
+    events = [{"type": "session_start"},
+              {"type": "test", "node": "tests/test_a.py::test_one",
+               "phase": "setup", "outcome": "passed"},
+              {"type": "test", "node": "tests/test_a.py::test_one",
+               "phase": "call", "outcome": "passed"},
+              {"type": "test", "node": "tests/test_a.py::test_one",
+               "phase": "teardown", "outcome": "passed"}]
+    ok, _, error = RG._verify_supervisor_events(events, ["tests/test_a.py::test_one"])
+    assert ok is False and "session_finish" in error
+
+
+def test_verify_supervisor_rejects_duplicate_and_out_of_order_events(tmp_path):
+    """v4: duplicate (node, phase) pairs and out-of-order phases are
+    rejected -- real pytest can never produce them."""
+    node = "tests/test_a.py::test_one"
+    base = [{"type": "session_start"},
+            {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+            {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
+            {"type": "test", "node": node, "phase": "teardown", "outcome": "passed"},
+            {"type": "session_finish", "exitstatus": 0}]
+    # Duplicate call event.
+    dup = base[:-1] + [{"type": "test", "node": node, "phase": "call", "outcome": "passed"}] + base[-1:]
+    ok, _, error = RG._verify_supervisor_events(dup, [node])
+    assert ok is False and "duplicate" in error
+    # Out of order: call before setup.
+    ooo = [{"type": "session_start"},
+           {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
+           {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+           {"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(ooo, [node])
+    assert ok is False and "out-of-order" in error
+    # Teardown before call.
+    ooo2 = [{"type": "session_start"},
+            {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+            {"type": "test", "node": node, "phase": "teardown", "outcome": "passed"},
+            {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
+            {"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(ooo2, [node])
+    assert ok is False and "out-of-order" in error
+
+
+def test_verify_supervisor_rejects_events_after_finish_and_bad_exitstatus(tmp_path):
+    """v4: no event may follow session_finish; the finish exitstatus must
+    be 0 and must match pytest's own exit code."""
+    node = "tests/test_a.py::test_one"
+    good = [{"type": "session_start"},
+            {"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+            {"type": "test", "node": node, "phase": "call", "outcome": "passed"},
+            {"type": "test", "node": node, "phase": "teardown", "outcome": "passed"},
+            {"type": "session_finish", "exitstatus": 0}]
+    # Event after finish.
+    late = good + [{"type": "test", "node": node, "phase": "call", "outcome": "passed"}]
+    ok, _, error = RG._verify_supervisor_events(late, [node])
+    assert ok is False and "after session_finish" in error
+    # Non-zero finish exitstatus.
+    bad_status = good[:-1] + [{"type": "session_finish", "exitstatus": 1}]
+    ok, _, error = RG._verify_supervisor_events(bad_status, [node], exit_code=1)
+    assert ok is False and "exitstatus" in error
+    # Finish exitstatus disagrees with pytest's exit code.
+    mismatch = good[:-1] + [{"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(mismatch, [node], exit_code=1)
+    assert ok is False and "does not match" in error
+    # Session_start not first.
+    not_first = [{"type": "test", "node": node, "phase": "setup", "outcome": "passed"},
+                 {"type": "session_start"},
+                 {"type": "session_finish", "exitstatus": 0}]
+    ok, _, error = RG._verify_supervisor_events(not_first, [node])
+    assert ok is False and "session_start" in error
+
+
+def test_plugin_is_noop_in_xdist_worker(tmp_path):
+    """v4 (R7 fix): in an xdist worker the plugin must NOT read the FD or
+    hold a token -- it returns from pytest_configure immediately. A worker
+    test that imports the plugin finds _TOKEN is None."""
+    # Load the plugin from its file path (gateway/ is not on sys.path).
+    import importlib.util
+    plug_spec = importlib.util.spec_from_file_location(
+        "quorum_supervisor_plugin_under_test",
+        ROOT / "gateway" / "quorum_supervisor_plugin.py")
+    plug = importlib.util.module_from_spec(plug_spec)
+    plug_spec.loader.exec_module(plug)
+    # Simulate the worker environment: xdist sets PYTEST_XDIST_WORKER.
+    os.environ["PYTEST_XDIST_WORKER"] = "gw0"
+    os.environ["QUORUM_SUPERVISOR_FD"] = "999"
+    try:
+        plug._TOKEN = "should-not-be-read"
+        plug._SOCK = "should-not-be-set"
+        plug.pytest_configure(None)
+        # In a worker the plugin must not have touched the FD or the token:
+        # it returns early, leaving _TOKEN/_SOCK as they were (the test
+        # sets them to sentinels above; a real worker has them None).
+        assert plug._IS_WORKER is True
+    finally:
+        os.environ.pop("PYTEST_XDIST_WORKER", None)
+        os.environ.pop("QUORUM_SUPERVISOR_FD", None)
+        plug._TOKEN = None
+        plug._SOCK = None
+        plug._IS_WORKER = False
+
+
+def test_worker_cannot_read_supervisor_token(tmp_path):
+    """v4 end-to-end (R7 fix): a test running in the xdist worker that
+    imports the trusted plugin and inspects it finds NO token and NO
+    socket -- the token lives only in the controller process. The test
+    itself still passes (it is a legitimate passing test), and the
+    supervisor evidence verifies it."""
+    subject = tmp_path / "subject"
+    (subject / "tests").mkdir(parents=True)
+    (subject / "tests" / "test_approved.py").write_text(
+        "import quorum_supervisor_plugin as plug\n"
+        "def test_kept():\n"
+        "    assert plug._TOKEN is None, 'token leaked into worker'\n"
+        "    assert plug._SOCK is None, 'socket leaked into worker'\n"
+        "    assert plug._IS_WORKER is True, 'plugin did not detect worker'\n")
+    registry = _pytest_registry(tmp_path)
+    result = tmp_path / "out" / "pytest-regression.json"
+    cmd = [sys.executable, str(SCRIPT), "check", "--subject", str(subject),
+           "--registry", str(registry), "--check-id", "pytest-regression",
+           "--result", str(result)]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    res = json.loads(result.read_text())
+    assert res["exit_code"] == 0, res
+    assert res["evidence_verified"] is True, res
+    assert res["evidence_summary"]["tests"] == 1
+    assert res["evidence_summary"]["session_finished"] is True
+    assert res["evidence_summary"]["nodes_verified"] == ["tests.test_approved::test_kept"]

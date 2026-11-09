@@ -1,41 +1,54 @@
-"""Trusted pytest plugin for the Quorum Gateway v3 supervisor.
+"""Trusted pytest plugin for the Quorum Gateway v4 supervisor.
 
-This plugin runs INSIDE the pytest process, but it is trusted code: it is
-loaded from the pinned verifier tree (never from the PR subject), and it
-reports test lifecycle events to an out-of-band supervisor over a Unix
-socket, authenticated with a per-run token.
+This plugin runs in the pytest CONTROLLER process only. It is trusted
+code: it is loaded from the pinned verifier tree (never from the PR
+subject), and it reports test lifecycle events to an out-of-band
+supervisor over a Unix socket, authenticated with a per-run token.
 
-Trust model (v3 — replaces the v2 junitxml evidence file, which the
-tested code could forge by writing to its predictable path and exiting 0):
-- The executor (trusted) creates a Unix socket at a random path and a
-  per-run random token. It passes the socket path and token to the
-  pytest process through a PIPE FILE DESCRIPTOR (pass_fds), NOT through
-  an environment variable, argv, or a file the test code can find.
-- This plugin reads the socket path + token from that FD at
-  pytest_configure time, then CLOSES the FD immediately and deletes the
-  env var naming it, so by the time any test/subject code runs, the FD
-  is gone and the token exists only in this plugin's memory.
+Trust model (v4 — two-process trust-domain separation, replaces the
+v3 single-process model, which had residual risk R7):
+- The gateway runs pytest under pytest-xdist (`-n 1`), so the actual
+  test code executes in a WORKER process, separate from the CONTROLLER
+  process that runs this plugin.
+- The per-run token reaches this plugin through a PIPE FILE DESCRIPTOR
+  (pass_fds), NOT through an environment variable, argv, or a file.
+  This plugin reads the socket path + token from that FD at
+  pytest_configure time, then CLOSES the FD immediately and deletes
+  the env var naming it.
+- The plugin ACTIVATES ONLY IN THE CONTROLLER. In a worker process
+  (detected via the PYTEST_XDIST_WORKER env var that xdist sets), it
+  returns from pytest_configure immediately without touching the FD,
+  the socket, or the token. The token therefore NEVER EXISTS in a
+  worker process's memory: a worker's test code can import this module
+  and will find _TOKEN is None and _SOCK is None — there is nothing to
+  steal. This closes R7 (same-process token exposure) structurally, not
+  by blacklist or tripwire.
+- In the controller, the plugin receives TestReport objects from the
+  workers through xdist's own channel (pytest_runtest_logreport fires
+  in the controller when a worker reports a result). The controller's
+  pytest — not the test code — generates those reports, so the test
+  code cannot forge a report for a test it did not run, and it cannot
+  change the outcome of a test that failed.
 - The plugin sends one event per test phase (setup/call/teardown) plus
   session_start / session_finish, each carrying the token. The
   supervisor validates the token and records the events; the gateway's
   decision rests ONLY on those supervisor events plus pytest's exit
-  code. There is NO evidence file for the tested code to forge.
+  code, under a strict state-machine check. There is NO evidence file
+  for the tested code to forge.
 - If the plugin cannot reach the supervisor, it fails loudly at
   configure time (pytest errors out) — fail-closed, never a silent
   pass without supervision.
 
 Residual risk (documented, not hidden): the token lives in this
-plugin's memory inside the pytest process, so test code that
-specifically hunts for it (importing this module and reading its
-internals, then impersonating the supervisor protocol) could in
-principle forge events. That is a targeted attack on the supervisor
-itself — qualitatively different from, and far more visible than,
-writing a predictable evidence file — and it is the reason the
-supervisor also requires a sane event sequence (session_start first,
-setup before call, call before teardown) and the gateway cross-checks
-the events against pytest's own exit code. Closing that last step
-airtight would need the tests to run in a separate trust domain from
-the reporter, which is a follow-up architecture item.
+plugin's memory inside the CONTROLLER process. Test code runs in a
+different process and cannot reach it. The remaining attack surface is
+a worker that compromises the controller through xdist's own channel
+(a protocol-level attack on execnet, not on this plugin) — out of
+scope for v4 and not known to be practical. The supervisor also
+requires a strict event state machine (session_start first, phases in
+order, session_finish last with exitstatus 0, no duplicates, no events
+after finish) and the gateway cross-checks the events against pytest's
+own exit code.
 """
 
 import json
@@ -44,12 +57,15 @@ import socket
 import sys
 
 # Connection state. The token is read from the supervisor FD at configure
-# time and kept only here (module scope of THIS trusted plugin). The FD is
-# closed and the env var deleted immediately after reading, before any
-# test/subject code runs.
+# time and kept only here (module scope of THIS trusted plugin, in the
+# CONTROLLER process). The FD is closed and the env var deleted
+# immediately after reading, before any worker is spawned. In a WORKER
+# process these stay None — the plugin never activates there, so there
+# is no token for worker test code to steal (R7 fix, v4).
 _SOCK = None
 _TOKEN = None
 _SESSION_STARTED = False
+_IS_WORKER = False
 
 
 def _send(event):
@@ -69,8 +85,14 @@ def _send(event):
 
 
 def pytest_configure(config):
-    """Connect to the supervisor. Fail loudly if unreachable."""
-    global _SOCK, _TOKEN
+    """Connect to the supervisor (controller only). Fail loudly if unreachable."""
+    global _SOCK, _TOKEN, _IS_WORKER
+    # v4 trust-domain split: in an xdist worker this plugin is a no-op.
+    # The worker never sees the FD, the socket, or the token, so worker
+    # test code cannot steal or forge supervisor events (R7).
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        _IS_WORKER = True
+        return
     fd_s = os.environ.get("QUORUM_SUPERVISOR_FD")
     if not fd_s:
         raise RuntimeError("quorum supervisor: QUORUM_SUPERVISOR_FD is not set")
@@ -86,7 +108,7 @@ def pytest_configure(config):
         raise RuntimeError(f"quorum supervisor: cannot read supervisor fd: {exc}")
     finally:
         # The FD is closed (closefd=True above, or on error). Remove the
-        # env var so test code cannot even learn the FD number.
+        # env var so no worker spawned afterwards can even learn the FD number.
         os.environ.pop("QUORUM_SUPERVISOR_FD", None)
     if not sock_path or not token:
         raise RuntimeError("quorum supervisor: empty socket path or token")

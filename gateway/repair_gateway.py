@@ -97,34 +97,82 @@ def _supervisor_node_matches(nodeid: str, node: str) -> bool:
     return got[-1].split("[", 1)[0] == want[-1]
 
 
-def _verify_supervisor_events(events: list[dict[str, Any]], nodes: list[str]) -> tuple[bool, dict[str, Any], str]:
-    """Verify structured supervisor evidence (v3).
+def _verify_supervisor_events(events: list[dict[str, Any]], nodes: list[str],
+                              exit_code: int = 0) -> tuple[bool, dict[str, Any], str]:
+    """Verify structured supervisor evidence under a STRICT state machine (v4).
 
     The evidence is the authenticated event log recorded by the trusted
-    supervisor — a separate process that the tested code cannot write
-    to — not a file the test process produced. Each expected node must
-    have a "call" phase event with outcome "passed" and no phase with
-    outcome "failed"/"error"; a session_start event must be present
-    (the plugin connected and the session actually began). A full-suite
-    check (no expected nodes) requires at least one passed call event
-    and zero failed/error call events, so an all-skipped run is
-    rejected. Returns (ok, summary, error)."""
+    supervisor -- a separate process that the tested code cannot write
+    to -- not a file the test process produced. The event sequence must
+    be a well-formed session, or the check is rejected fail-closed:
+
+    - Event 0 MUST be session_start (exactly once, at position 0).
+    - Then test events, in per-node phase order setup -> call ->
+      teardown, each (node, phase) at most once. A phase that arrives
+      out of order (call before setup, teardown before call) or twice
+      for the same node is rejected -- it is not a sequence real pytest
+      can produce.
+    - The LAST event MUST be session_finish (exactly once, at the final
+      position), with exitstatus 0, and exitstatus MUST match pytest's
+      own exit code. A missing session_finish (abnormal exit, killed
+      process) is rejected. No event may follow session_finish.
+    - Each expected node must have a "call" phase event with outcome
+      "passed" and no phase with outcome "failed"/"error"; a session
+      with no passed call (zero tests, all skipped) is rejected. For a
+      full-suite check (no expected nodes) at least one passed call and
+      zero failed/error call events are required.
+
+    Returns (ok, summary, error)."""
     summary: dict[str, Any] = {"tests": 0, "failures": 0, "errors": 0,
                                "skipped": 0, "events": len(events),
                                "session_started": False, "session_finished": False}
-    if not any(e.get("type") == "session_start" for e in events):
-        return False, summary, "supervisor saw no session_start: the test session never began under supervision"
+    if not events:
+        return False, summary, "supervisor saw no session_start (no events at all): the test session never began under supervision"
+    # --- State machine: session_start first, exactly once, at position 0.
+    first = events[0]
+    if first.get("type") != "session_start":
+        return False, summary, "supervisor events do not begin with session_start: the session never began under supervision"
     summary["session_started"] = True
-    summary["session_finished"] = any(e.get("type") == "session_finish" for e in events)
+    if sum(1 for e in events if e.get("type") == "session_start") != 1:
+        return False, summary, "supervisor saw more than one session_start event"
+    # --- State machine: session_finish last, exactly once, with exitstatus 0
+    # matching pytest's own exit code. A missing finish means the session
+    # did not end normally (abnormal exit, killed process).
+    finish_idx = [i for i, e in enumerate(events) if e.get("type") == "session_finish"]
+    if len(finish_idx) != 1:
+        return False, summary, "supervisor saw no session_finish: the test session did not end normally" if not finish_idx else "supervisor saw more than one session_finish event"
+    if finish_idx[0] != len(events) - 1:
+        return False, summary, "supervisor saw events after session_finish"
+    summary["session_finished"] = True
+    finish = events[finish_idx[0]]
+    finish_status = finish.get("exitstatus")
+    if finish_status != 0:
+        return False, summary, f"supervisor session_finish exitstatus is {finish_status!r}, not 0: the test session did not pass"
+    if finish_status != exit_code:
+        return False, summary, f"supervisor session_finish exitstatus ({finish_status!r}) does not match pytest's exit code ({exit_code!r})"
+    # --- State machine: per-node phase order, no duplicates, no out-of-order.
+    phase_order = {"setup": 0, "call": 1, "teardown": 2}
     by_node: dict[str, dict[str, str]] = {}
+    seen_phase: set[tuple[str, str]] = set()
     call_passed = 0
-    for e in events:
+    for e in events[1:finish_idx[0]]:
         if e.get("type") != "test":
-            continue
+            return False, summary, f"supervisor saw a non-test event inside the session: {e.get('type')!r}"
         node, phase, outcome = e.get("node"), e.get("phase"), e.get("outcome")
         if not isinstance(node, str) or not isinstance(phase, str) or not isinstance(outcome, str):
-            continue
-        by_node.setdefault(node, {})[phase] = outcome
+            return False, summary, "supervisor saw a malformed test event (node/phase/outcome missing or not a string)"
+        if phase not in phase_order:
+            return False, summary, f"supervisor saw an unknown test phase: {phase!r}"
+        if (node, phase) in seen_phase:
+            return False, summary, f"supervisor saw a duplicate test event for node {node!r} phase {phase!r}"
+        seen_phase.add((node, phase))
+        node_phases = by_node.setdefault(node, {})
+        # Phases for a node must arrive in setup -> call -> teardown order.
+        if node_phases:
+            last_phase = max(node_phases, key=lambda p: phase_order[p])
+            if phase_order[phase] <= phase_order[last_phase]:
+                return False, summary, f"supervisor saw out-of-order phases for node {node!r}: {phase!r} after {last_phase!r}"
+        node_phases[phase] = outcome
         if phase == "call":
             summary["tests"] += 1
             if outcome == "passed":
@@ -416,6 +464,18 @@ def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) ->
       the expected test actually started, completed, and passed. There
       is NO evidence file for the tested code to forge — pytest is not
       even given a --junitxml path.
+    - Trust-domain split (v4, closes R7): pytest runs under xdist
+      (`-n 1`), so the test code executes in a WORKER process while the
+      trusted plugin and its token live only in the CONTROLLER process.
+      The plugin is a no-op in workers (PYTEST_XDIST_WORKER set), so
+      worker test code cannot read the token, reach the socket, or
+      forge supervisor events. The controller's pytest — not the test
+      code — generates the TestReport objects the plugin forwards.
+    - Strict state machine (v4): the supervisor event log must be a
+      well-formed session (session_start first, phases in order,
+      session_finish last with exitstatus 0 matching pytest's own exit
+      code, no duplicates, no events after finish), or the check is
+      rejected fail-closed.
     Returns the check outcome fields for the result JSON."""
     nodes, deselects = _parse_pytest_argv(spec["argv"])
     shim_dir = Path(tempfile.mkdtemp(prefix="trusted-pytest-shim-"))
@@ -446,6 +506,12 @@ def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) ->
         cmd = ["python3", "-m", "pytest", "-c", "/dev/null", "-o", "addopts=",
                "--noconftest", "-p", "no:cacheprovider",
                "-p", "quorum_supervisor_plugin",
+               # v4 trust-domain split: run the tests in an xdist WORKER
+               # process, so the test code never shares a process (or the
+               # supervisor token) with the trusted plugin, which runs
+               # only in the CONTROLLER. `-n 1` forces a single worker
+               # even for a one-node check. xdist is a dev dependency.
+               "-n", "1",
                "--rootdir", str(subject)]
         cmd.append("-v" if nodes else "-q")
         # --deselect takes a node id, matched against the collected tests'
@@ -485,7 +551,7 @@ def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) ->
             except OSError:
                 pass
         events = supervisor.stop() if supervisor is not None else []
-        ok, summary, error = _verify_supervisor_events(events, nodes)
+        ok, summary, error = _verify_supervisor_events(events, nodes, exit_code=outcome["exit_code"])
         outcome["evidence_summary"] = summary
         outcome["evidence_error"] = error
         # Evidence is only meaningful when the command itself exited 0; a
