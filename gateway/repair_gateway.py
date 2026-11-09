@@ -9,15 +9,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any
 
 SCHEMA = 1
@@ -28,6 +32,277 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 MAX_BODY = 32_000
 # A deliberately narrow, code-reviewed list. Workflow/config/code/test changes NEVER skip.
 DOC_PATH = re.compile(r"(?:README\.md|(?:docs|examples)/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.md)\Z")
+# A pytest test target: a relative .py path (no traversal, no leading dash)
+# plus optional :: segments (class / test / parametrize id).
+NODE_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_./-]*\.py(::[A-Za-z0-9_.\[\]-]+)*$")
+
+
+def _node_parts(node: str) -> tuple[str, str]:
+    """Map a node id to the (classname, test name) pair junitxml uses."""
+    parts = node.split("::")
+    classname = parts[0][:-3].replace("/", ".")
+    if len(parts) > 2:
+        classname += "." + ".".join(parts[1:-1])
+    return classname, parts[-1].split("[", 1)[0]
+
+
+def _abs_node(subject: Path, node: str) -> str:
+    """Resolve a registry node id to an absolute path (file part only)."""
+    parts = node.split("::")
+    return str(subject / parts[0]) + ("::" + "::".join(parts[1:]) if len(parts) > 1 else "")
+
+
+def _parse_pytest_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Extract only test targets from a trusted-registry pytest argv.
+
+    The executor rebuilds the command from a fixed trusted template, so a
+    registry entry can never smuggle in a plugin (`-p`), a config override
+    (`-c`, `-o`, `--override-ini`, `--rootdir`), a different import mode, or
+    any other pytest flag. Only verbosity, --noconftest, --deselect and
+    test node ids survive; anything else fails closed."""
+    require(argv[:3] == ["python3", "-m", "pytest"],
+            "Pytest check must use the approved python3 -m pytest form")
+    nodes, deselects = [], []
+    i = 3
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-q", "-v", "--noconftest"):
+            i += 1
+        elif a == "--deselect":
+            require(i + 1 < len(argv) and NODE_RE.fullmatch(argv[i + 1])
+                    and ".." not in Path(argv[i + 1]).parts,
+                    "Invalid --deselect target in trusted registry")
+            deselects.append(argv[i + 1])
+            i += 2
+        elif NODE_RE.fullmatch(a) and ".." not in Path(a).parts:
+            nodes.append(a)
+            i += 1
+        else:
+            raise IntakeError(f"Unapproved pytest argument in trusted registry: {a[:80]}")
+    return nodes, deselects
+
+
+def _supervisor_node_matches(nodeid: str, node: str) -> bool:
+    """True when a supervisor event nodeid is the registry node.
+
+    Both are pytest node ids ("path/test_x.py[::Class]::test_y", the
+    supervisor's test name possibly carrying a [param] suffix). The file
+    part, any class segments, and the test name must all match."""
+    want = node.split("::")
+    got = nodeid.split("::")
+    if len(got) != len(want) or got[0] != want[0]:
+        return False
+    if got[1:-1] != want[1:-1]:
+        return False
+    return got[-1].split("[", 1)[0] == want[-1]
+
+
+def _verify_supervisor_events(events: list[dict[str, Any]], nodes: list[str],
+                              exit_code: int = 0) -> tuple[bool, dict[str, Any], str]:
+    """Verify structured supervisor evidence under a STRICT state machine (v4).
+
+    The evidence is the authenticated event log recorded by the trusted
+    supervisor -- a separate process that the tested code cannot write
+    to -- not a file the test process produced. The event sequence must
+    be a well-formed session, or the check is rejected fail-closed:
+
+    - Event 0 MUST be session_start (exactly once, at position 0).
+    - Then test events, in per-node phase order setup -> call ->
+      teardown, each (node, phase) at most once. A phase that arrives
+      out of order (call before setup, teardown before call) or twice
+      for the same node is rejected -- it is not a sequence real pytest
+      can produce.
+    - The LAST event MUST be session_finish (exactly once, at the final
+      position), with exitstatus 0, and exitstatus MUST match pytest's
+      own exit code. A missing session_finish (abnormal exit, killed
+      process) is rejected. No event may follow session_finish.
+    - Each expected node must have a "call" phase event with outcome
+      "passed" and no phase with outcome "failed"/"error"; a session
+      with no passed call (zero tests, all skipped) is rejected. For a
+      full-suite check (no expected nodes) at least one passed call and
+      zero failed/error call events are required.
+
+    Returns (ok, summary, error)."""
+    summary: dict[str, Any] = {"tests": 0, "failures": 0, "errors": 0,
+                               "skipped": 0, "events": len(events),
+                               "session_started": False, "session_finished": False}
+    if not events:
+        return False, summary, "supervisor saw no session_start (no events at all): the test session never began under supervision"
+    # --- State machine: session_start first, exactly once, at position 0.
+    first = events[0]
+    if first.get("type") != "session_start":
+        return False, summary, "supervisor events do not begin with session_start: the session never began under supervision"
+    summary["session_started"] = True
+    if sum(1 for e in events if e.get("type") == "session_start") != 1:
+        return False, summary, "supervisor saw more than one session_start event"
+    # --- State machine: session_finish last, exactly once, with exitstatus 0
+    # matching pytest's own exit code. A missing finish means the session
+    # did not end normally (abnormal exit, killed process).
+    finish_idx = [i for i, e in enumerate(events) if e.get("type") == "session_finish"]
+    if len(finish_idx) != 1:
+        return False, summary, "supervisor saw no session_finish: the test session did not end normally" if not finish_idx else "supervisor saw more than one session_finish event"
+    if finish_idx[0] != len(events) - 1:
+        return False, summary, "supervisor saw events after session_finish"
+    summary["session_finished"] = True
+    finish = events[finish_idx[0]]
+    finish_status = finish.get("exitstatus")
+    if finish_status != 0:
+        return False, summary, f"supervisor session_finish exitstatus is {finish_status!r}, not 0: the test session did not pass"
+    if finish_status != exit_code:
+        return False, summary, f"supervisor session_finish exitstatus ({finish_status!r}) does not match pytest's exit code ({exit_code!r})"
+    # --- State machine: per-node phase order, no duplicates, no out-of-order.
+    phase_order = {"setup": 0, "call": 1, "teardown": 2}
+    by_node: dict[str, dict[str, str]] = {}
+    seen_phase: set[tuple[str, str]] = set()
+    call_passed = 0
+    for e in events[1:finish_idx[0]]:
+        if e.get("type") != "test":
+            return False, summary, f"supervisor saw a non-test event inside the session: {e.get('type')!r}"
+        node, phase, outcome = e.get("node"), e.get("phase"), e.get("outcome")
+        if not isinstance(node, str) or not isinstance(phase, str) or not isinstance(outcome, str):
+            return False, summary, "supervisor saw a malformed test event (node/phase/outcome missing or not a string)"
+        if phase not in phase_order:
+            return False, summary, f"supervisor saw an unknown test phase: {phase!r}"
+        if (node, phase) in seen_phase:
+            return False, summary, f"supervisor saw a duplicate test event for node {node!r} phase {phase!r}"
+        seen_phase.add((node, phase))
+        node_phases = by_node.setdefault(node, {})
+        # Phases for a node must arrive in setup -> call -> teardown order,
+        # and each phase requires its predecessor: a call without a setup,
+        # or a teardown without a call, is not a sequence real pytest can
+        # produce (missing setup / missing teardown).
+        if phase == "call" and "setup" not in node_phases:
+            return False, summary, f"supervisor saw a call event for node {node!r} with no setup event (missing setup)"
+        if phase == "teardown" and "call" not in node_phases:
+            return False, summary, f"supervisor saw a teardown event for node {node!r} with no call event (missing call)"
+        if node_phases:
+            last_phase = max(node_phases, key=lambda p: phase_order[p])
+            if phase_order[phase] <= phase_order[last_phase]:
+                return False, summary, f"supervisor saw out-of-order phases for node {node!r}: {phase!r} after {last_phase!r}"
+        node_phases[phase] = outcome
+        if phase == "call":
+            summary["tests"] += 1
+            if outcome == "passed":
+                call_passed += 1
+            elif outcome == "failed":
+                summary["failures"] += 1
+            elif outcome == "error":
+                summary["errors"] += 1
+            elif outcome == "skipped":
+                summary["skipped"] += 1
+    # A passed call requires a teardown: real pytest always reports
+    # teardown for a test whose setup and call both completed. A passed
+    # call with no teardown means the session was interrupted after the
+    # call, or the events were forged incompletely.
+    for nid, phases in by_node.items():
+        if phases.get("call") == "passed" and "teardown" not in phases:
+            return False, summary, f"supervisor saw a passed call for node {nid!r} with no teardown event (missing teardown)"
+    if nodes:
+        found = []
+        for node in nodes:
+            classname, name = _node_parts(node)
+            hit = None
+            for nid, phases in by_node.items():
+                if _supervisor_node_matches(nid, node):
+                    hit = phases
+                    break
+            if hit is None:
+                return False, summary, f"supervisor saw no test event for node: {classname}::{name}"
+            if hit.get("call") != "passed":
+                return False, summary, f"supervisor shows node did not pass: {classname}::{name} (call={hit.get('call')})"
+            if any(v in ("failed", "error") for v in hit.values()):
+                return False, summary, f"supervisor shows node failed in some phase: {classname}::{name}"
+            found.append(f"{classname}::{name}")
+        summary["nodes_verified"] = found
+        if summary["tests"] < len(nodes):
+            return False, summary, "supervisor saw fewer test calls than expected nodes"
+    else:
+        if call_passed < 1:
+            return False, summary, "supervisor saw no passed test: zero tests or all skipped"
+        if summary["failures"] or summary["errors"]:
+            return False, summary, "supervisor reports failures or errors"
+    if summary["failures"] or summary["errors"]:
+        return False, summary, "supervisor reports failures or errors"
+    return True, summary, ""
+
+
+class _Supervisor:
+    """Trusted out-of-band test supervisor (v3).
+
+    Listens on a Unix socket at a random path in a trusted temp dir and
+    records authenticated test lifecycle events sent by the trusted
+    pytest plugin. The tested code cannot write to this socket without
+    the per-run token, which reaches the plugin through a pipe FD that
+    is closed before any test code runs. The supervisor runs in the
+    executor process (a thread), so its event log is never a file the
+    test process produced or could overwrite."""
+
+    def __init__(self, sock_dir: Path, token: str):
+        self.sock_path = str(sock_dir / "supervisor.sock")
+        self.token = token
+        self.events: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(self.sock_path)
+        self._sock.listen(4)
+        self._sock.settimeout(0.25)
+        self._thread = threading.Thread(target=self._serve, daemon=True, name="quorum-supervisor")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                conn.settimeout(1.0)
+                buf = b""
+                while not self._stop.is_set():
+                    try:
+                        chunk = conn.recv(65536)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if not hmac.compare_digest(str(event.get("token", "")), self.token):
+                            continue
+                        event = {k: v for k, v in event.items() if k != "token"}
+                        with self._lock:
+                            self.events.append(event)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def stop(self) -> list[dict[str, Any]]:
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+        with self._lock:
+            return list(self.events)
 
 
 class IntakeError(ValueError):
@@ -174,8 +449,148 @@ def docs_only_changes(subject: Path, base: Path, github_base_sha: str) -> list[s
     return changed
 
 
+def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) -> dict[str, Any]:
+    """Run a trusted-registry pytest check through the hardened executor.
+
+    Trust boundary (v3, 2026-11-09 — replaces the v2 junitxml evidence
+    file, which the tested code could forge by writing to its predictable
+    path during import and exiting 0):
+    - The subject's pytest config is never read: `-c /dev/null` plus
+      `-o addopts=` means no pyproject.toml / pytest.ini / setup.cfg /
+      tox.ini in the PR tree can add options or load plugins.
+    - No conftest.py (`--noconftest`) and no plugin other than the cache
+      provider disable (`-p no:cacheprovider`) plus the TRUSTED
+      supervisor plugin (`-p quorum_supervisor_plugin`, loaded from the
+      pinned verifier tree, never from the subject); the registry argv is
+      parsed through a strict allowlist and the command is rebuilt from a
+      fixed template, so a registry entry can never smuggle in another flag.
+    - Python startup hooks in the subject tree cannot run: pytest is
+      launched with a trusted temp dir as cwd and PYTHONPATH, so the
+      subject root is never on sys.path at interpreter startup (site would
+      otherwise execute its sitecustomize.py / .pth files). The package
+      under test is exposed only through a symlink in that trusted dir,
+      and --rootdir pins pytest's own root to the subject.
+    - Evidence comes from a TRUSTED SUPERVISOR, not from a file: the
+      trusted plugin reports each test's start/finish/outcome to the
+      supervisor over a Unix socket, authenticated with a per-run token
+      that reaches the plugin through a pipe FD (closed before any test
+      code runs). The supervisor's event log is the sole evidence that
+      the expected test actually started, completed, and passed. There
+      is NO evidence file for the tested code to forge — pytest is not
+      even given a --junitxml path.
+    - Trust-domain split (v4, closes R7): pytest runs under xdist
+      (`-n 1`), so the test code executes in a WORKER process while the
+      trusted plugin and its token live only in the CONTROLLER process.
+      The plugin is a no-op in workers (PYTEST_XDIST_WORKER set), so
+      worker test code cannot read the token, reach the socket, or
+      forge supervisor events. The controller's pytest — not the test
+      code — generates the TestReport objects the plugin forwards.
+    - Strict state machine (v4): the supervisor event log must be a
+      well-formed session (session_start first, phases in order,
+      session_finish last with exitstatus 0 matching pytest's own exit
+      code, no duplicates, no events after finish), or the check is
+      rejected fail-closed.
+    Returns the check outcome fields for the result JSON."""
+    nodes, deselects = _parse_pytest_argv(spec["argv"])
+    shim_dir = Path(tempfile.mkdtemp(prefix="trusted-pytest-shim-"))
+    sup_dir = Path(tempfile.mkdtemp(prefix="trusted-supervisor-"))
+    outcome: dict[str, Any] = {"exit_code": 1, "timed_out": False, "out": "", "err": "",
+                               "evidence_verified": False, "evidence_summary": {},
+                               "evidence_error": "", "executed_argv": []}
+    supervisor = None
+    try:
+        pkg = subject / "quorum"
+        if pkg.is_dir():
+            (shim_dir / "quorum").symlink_to(pkg, target_is_directory=True)
+        # Trusted supervisor plugin, from the pinned verifier tree (this
+        # file's own directory), exposed through the shim dir only.
+        plugin_src = Path(__file__).resolve().parent / "quorum_supervisor_plugin.py"
+        (shim_dir / "quorum_supervisor_plugin.py").symlink_to(plugin_src)
+        token = secrets.token_hex(32)
+        supervisor = _Supervisor(sup_dir, token)
+        supervisor.start()
+        # Pass the socket path + token to the plugin through a pipe FD.
+        # The plugin reads them at configure time and closes the FD
+        # before any test/subject code runs.
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, f"{supervisor.sock_path}\n{token}\n".encode("utf-8"))
+        finally:
+            os.close(wfd)
+        cmd = ["python3", "-m", "pytest", "-c", "/dev/null", "-o", "addopts=",
+               "--noconftest", "-p", "no:cacheprovider",
+               "-p", "quorum_supervisor_plugin",
+               # v4 trust-domain split: run the tests in an xdist WORKER
+               # process, so the test code never shares a process (or the
+               # supervisor token) with the trusted plugin, which runs
+               # only in the CONTROLLER. `-n 1` forces a single worker
+               # even for a one-node check. xdist is a dev dependency.
+               "-n", "1",
+               "--rootdir", str(subject)]
+        cmd.append("-v" if nodes else "-q")
+        # --deselect takes a node id, matched against the collected tests'
+        # rootdir-relative ids: it must stay in the registry's relative
+        # form. (An absolute path here does not match, so the deselected
+        # test would run — in the read-only container it would then fail
+        # for writing inside the repo, breaking the all-unit check.)
+        for d in deselects:
+            cmd += ["--deselect", d]
+        # With no node target (full-suite check) pytest must be told where
+        # to collect: it defaults to the cwd, which here is the trusted
+        # shim dir, not the subject. Passing the subject as the collection
+        # root replicates the old cwd=subject behaviour.
+        cmd += [_abs_node(subject, n) for n in nodes] if nodes else [str(subject)]
+        outcome["executed_argv"] = cmd
+        env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
+        env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+                    "PYTHONPATH": str(shim_dir),
+                    "QUORUM_SUPERVISOR_FD": str(rfd)})
+        try:
+            proc = subprocess.run(cmd, cwd=shim_dir, env=env, text=True,
+                                  capture_output=True, pass_fds=(rfd,),
+                                  timeout=int(spec.get("timeout_seconds", 120)),
+                                  check=False, errors="replace")
+            outcome["exit_code"], outcome["out"], outcome["err"] = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            outcome["timed_out"] = True
+            outcome["exit_code"] = 124
+            outcome["out"] = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            outcome["err"] = "TIMEOUT: approved check exceeded timeout"
+        except (OSError, ValueError) as exc:
+            outcome["err"] = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
+            outcome["exit_code"] = 127
+        finally:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+        events = supervisor.stop() if supervisor is not None else []
+        ok, summary, error = _verify_supervisor_events(events, nodes, exit_code=outcome["exit_code"])
+        outcome["evidence_summary"] = summary
+        outcome["evidence_error"] = error
+        # Evidence is only meaningful when the command itself exited 0; a
+        # non-zero exit is already a failed check (FAIL_REPRODUCED).
+        outcome["evidence_verified"] = bool(outcome["exit_code"] == 0 and ok)
+        outcome["supervisor_evidence_sha256"] = digest(
+            json.dumps(events, sort_keys=True).encode("utf-8"))
+        outcome["supervisor_events"] = len(events)
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
+        shutil.rmtree(sup_dir, ignore_errors=True)
+    return outcome
+
+
 def cmd_check(a: argparse.Namespace) -> int:
-    """Trusted wrapper invoked by quorum verify via a generated ledger check."""
+    """Trusted wrapper invoked by quorum verify via a generated ledger check.
+
+    Pytest checks run through the hardened trusted executor
+    (_run_pytest_check): the subject's pytest config, conftest and Python
+    startup hooks are all neutralised, and the pass verdict rests on the
+    trusted supervisor's authenticated event log, never on output strings
+    and never on a file the test process produced (v3, 2026-11-09).
+    Non-pytest approved commands run verbatim as before: they come from
+    the trusted registry, have no test-run concept, and their exit code
+    is their own evidence. The production registry is pytest-only."""
     subject = Path(a.subject).resolve()
     result_path = Path(a.result).resolve()
     registry = load_registry(Path(a.registry).resolve())
@@ -183,52 +598,68 @@ def cmd_check(a: argparse.Namespace) -> int:
     require(check_id in registry, "Unknown check")
     spec = registry[check_id]
     out = ""; err = ""; code = 1; timed_out = False
-    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
-    env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(subject)})
-    t0 = dt.datetime.now(dt.timezone.utc)
-    try:
-        proc = subprocess.run(spec["argv"], cwd=subject, env=env, text=True,
-                              capture_output=True, timeout=int(spec.get("timeout_seconds", 120)), check=False,
-                              errors="replace")
-        code, out, err = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True; code = 124
-        out = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = "TIMEOUT: approved check exceeded timeout"
-    except (OSError, ValueError) as exc:
-        err = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
-        code = 127
-    # Evidence-of-execution (P0, 2026-11-08): an exit code of 0 is only
-    # trustworthy if a test actually ran. A conftest.py — or import-time code
-    # in the subject tree — that calls os._exit(0) produces an empty log with
-    # exit 0; without this check the gate would record a PASS for a repair
-    # that was never tested. This applies to pytest checks only: a non-pytest
-    # approved command has no test-run concept, and its exit code is its own
-    # evidence. Node-targeted checks must show the node id (-v) or a passing
-    # summary (-q); the full-suite check must show a passing-test summary.
     evidence_verified = True
-    if code == 0 and "pytest" in spec["argv"]:
-        combined = out + "\n" + err
-        node = next((a for a in spec["argv"] if "::" in a), None)
-        if node is not None:
-            if node not in combined and " passed" not in combined:
-                evidence_verified = False
-                err = f"CHECK_EVIDENCE_MISSING: targeted test node did not run: {node}"
-        elif " passed" not in combined:
-            evidence_verified = False
-            err = "CHECK_EVIDENCE_MISSING: no passing-test summary in log"
-        if not evidence_verified:
-            code = 1
+    evidence_summary: dict[str, Any] = {}
+    evidence_error = ""
+    executed_argv: list[str] = list(spec["argv"])
+    supervisor_evidence_sha256 = None
+    supervisor_events = None
+    t0 = dt.datetime.now(dt.timezone.utc)
+    if "pytest" in spec["argv"]:
+        try:
+            outcome = _run_pytest_check(subject, spec, result_path)
+        except IntakeError as exc:
+            # Unapproved registry content fails closed, with a result JSON.
+            outcome = {"exit_code": 127, "timed_out": False, "out": "",
+                       "err": f"CHECK_CONFIG_ERROR: {exc}", "evidence_verified": False,
+                       "evidence_summary": {}, "evidence_error": str(exc),
+                       "executed_argv": []}
+        code, out, err = outcome["exit_code"], outcome["out"], outcome["err"]
+        timed_out = outcome["timed_out"]
+        evidence_verified = outcome["evidence_verified"]
+        evidence_summary = outcome["evidence_summary"]
+        evidence_error = outcome["evidence_error"]
+        executed_argv = outcome["executed_argv"]
+        supervisor_evidence_sha256 = outcome.get("supervisor_evidence_sha256")
+        supervisor_events = outcome.get("supervisor_events")
+        if not evidence_verified and code == 0:
+            # The command exited 0 but produced no trustworthy evidence
+            # that a test ran. Do not override the exit code: the audit
+            # distinguishes this (EVIDENCE_MISSING) from a reproduced
+            # regression (FAIL_REPRODUCED) via evidence_verified.
+            err = f"CHECK_EVIDENCE_MISSING: {evidence_error}" if evidence_error else "CHECK_EVIDENCE_MISSING"
+    else:
+        env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
+        env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(subject)})
+        try:
+            proc = subprocess.run(spec["argv"], cwd=subject, env=env, text=True,
+                                  capture_output=True, timeout=int(spec.get("timeout_seconds", 120)), check=False,
+                                  errors="replace")
+            code, out, err = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True; code = 124
+            out = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err = "TIMEOUT: approved check exceeded timeout"
+        except (OSError, ValueError) as exc:
+            err = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
+            code = 127
     # Bound collected bytes; no credential environment variables passed to the check.
     log = ("STDOUT:\n" + out + "\nSTDERR:\n" + err)[-65_536:]
     log_path = result_path.with_suffix(".log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(log, encoding="utf-8")
-    write_json(result_path, {"check_id": check_id, "approved_argv": spec["argv"],
-                             "exit_code": code, "timed_out": timed_out,
-                             "evidence_verified": evidence_verified,
-                             "duration_seconds": round((dt.datetime.now(dt.timezone.utc)-t0).total_seconds(), 3),
-                             "log_sha256": digest(log.encode("utf-8")), "log_file": log_path.name})
+    result: dict[str, Any] = {"check_id": check_id, "approved_argv": executed_argv,
+                              "registry_argv": spec["argv"],
+                              "exit_code": code, "timed_out": timed_out,
+                              "evidence_verified": evidence_verified,
+                              "evidence_summary": evidence_summary,
+                              "evidence_error": evidence_error,
+                              "duration_seconds": round((dt.datetime.now(dt.timezone.utc)-t0).total_seconds(), 3),
+                              "log_sha256": digest(log.encode("utf-8")), "log_file": log_path.name}
+    if supervisor_evidence_sha256 is not None:
+        result["supervisor_evidence_sha256"] = supervisor_evidence_sha256
+        result["supervisor_events"] = supervisor_events
+    write_json(result_path, result)
     print(f"APPROVED_CHECK id={check_id} exit={code} evidence={result_path} log_sha256={digest(log.encode('utf-8'))}")
     if code != 0:
         print(log[-1200:], file=sys.stderr)
@@ -319,6 +750,13 @@ def cmd_audit(a: argparse.Namespace) -> int:
             summary["error"]="At least one approved check did not produce evidence"
         elif any(r["exit_code"] != 0 for r in results):
             summary["decision"]="FAIL_REPRODUCED"
+        elif any(r.get("evidence_verified") is not True for r in results):
+            # A check exited 0 but produced no verifiable structured
+            # evidence that its test ran and passed (v2, 2026-11-08).
+            # This is a missing-evidence outcome, not a reproduced
+            # regression: the repair is unverified, and the merge is blocked.
+            summary["decision"]="EVIDENCE_MISSING"
+            summary["error"]="At least one approved check produced no verifiable test evidence"
         elif p.returncode == 0:
             summary["decision"]="PASS_VERIFIED"
         else:
