@@ -317,11 +317,13 @@ def test_claim_marker_duplicated_does_not_skip(nonrepair_fixture):
 
 
 # ---------------------------------------------------------------------------
-# Trusted test executor v2 (2026-11-08): the pass verdict must rest on
-# structured junitxml evidence from a hardened pytest invocation, never on
-# output strings. These tests use only harmless probes (a standard
-# --collect-only config flag, a marker-writing sitecustomize, and direct
-# XML parsing) — no forged-pass plugin is created anywhere.
+# Trusted test executor v3 (2026-11-09): the pass verdict must rest on the
+# supervisor's authenticated event log from a hardened pytest invocation,
+# never on output strings and never on a file the test process produced
+# (v2's junitxml was forgeable by import-time code). These tests use only
+# harmless probes (a standard --collect-only config flag, a marker-writing
+# sitecustomize, and a forged XML that is never trusted) — no forged-pass
+# plugin is created anywhere.
 # ---------------------------------------------------------------------------
 
 def _pytest_registry(tmp_path, check_id="pytest-regression"):
@@ -340,7 +342,7 @@ def test_subject_pytest_config_is_ignored(fixture):
     """A PR-controlled pytest config cannot change the check: addopts
     (--collect-only) would make pytest exit 0 without running any test,
     yet the hardened executor ignores the subject config entirely, so the
-    approved test actually runs and the junitxml evidence verifies it."""
+    approved test actually runs and the supervisor evidence verifies it."""
     subject, registry, event, claim, make_event, fake, sha, tmp = fixture
     (subject / "pyproject.toml").write_text(
         "[tool.pytest.ini_options]\naddopts = \"--collect-only\"\n")
@@ -358,9 +360,12 @@ def test_subject_pytest_config_is_ignored(fixture):
     assert res["evidence_verified"] is True
     assert res["evidence_summary"]["tests"] == 1
     assert res["evidence_summary"]["nodes_verified"] == ["tests.test_approved::test_kept"]
-    assert res["junitxml_file"].endswith(".xml")
+    assert res["evidence_summary"]["session_started"] is True
+    assert res["supervisor_evidence_sha256"]
+    assert res["supervisor_events"] >= 3
     assert "-c" in res["approved_argv"] and "/dev/null" in res["approved_argv"]
-    assert "--junitxml" in res["approved_argv"]
+    assert "--junitxml" not in res["approved_argv"]
+    assert "-p" in res["approved_argv"] and "quorum_supervisor_plugin" in res["approved_argv"]
 
 
 def test_subject_startup_hook_is_not_executed(tmp_path):
@@ -416,56 +421,88 @@ def test_unapproved_pytest_argument_fails_closed(tmp_path):
     assert "Unapproved pytest argument" in res["evidence_error"]
 
 
-def _junitxml(tmp_path, name, text):
-    path = tmp_path / name
-    path.write_text(text)
-    return path
+def _sup_events(*evs):
+    """Build a supervisor event list: session_start + the given test events."""
+    out = [{"type": "session_start"}]
+    for node, phase, outcome in evs:
+        out.append({"type": "test", "node": node, "phase": phase, "outcome": outcome})
+    out.append({"type": "session_finish", "exitstatus": 0})
+    return out
 
 
-def test_verify_junitxml_accepts_real_pass(tmp_path):
-    xml = _junitxml(tmp_path, "ok.xml", """<?xml version="1.0" encoding="utf-8"?>
-<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="0.1">
-<testcase classname="tests.test_approved" name="test_kept" time="0.01" />
-</testsuite></testsuites>""")
-    ok, summary, error = RG._verify_junitxml(xml, ["tests/test_approved.py::test_kept"])
+def test_verify_supervisor_accepts_real_pass(tmp_path):
+    events = _sup_events(("tests/test_approved.py::test_kept", "setup", "passed"),
+                         ("tests/test_approved.py::test_kept", "call", "passed"),
+                         ("tests/test_approved.py::test_kept", "teardown", "passed"))
+    ok, summary, error = RG._verify_supervisor_events(events, ["tests/test_approved.py::test_kept"])
     assert ok is True and error == ""
     assert summary["tests"] == 1 and summary["failures"] == 0
+    assert summary["session_started"] is True
     assert summary["nodes_verified"] == ["tests.test_approved::test_kept"]
 
 
-def test_verify_junitxml_rejects_failure_missing_and_malformed(tmp_path):
-    failing = _junitxml(tmp_path, "fail.xml", """<?xml version="1.0" encoding="utf-8"?>
-<testsuites><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.1">
-<testcase classname="tests.test_approved" name="test_kept" time="0.01"><failure message="assert">x</failure></testcase>
-</testsuite></testsuites>""")
-    ok, _, error = RG._verify_junitxml(failing, ["tests/test_approved.py::test_kept"])
-    assert ok is False and "failures" in error
-    missing = _junitxml(tmp_path, "missing.xml", """<?xml version="1.0" encoding="utf-8"?>
-<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="0.1">
-<testcase classname="tests.test_approved" name="test_other" time="0.01" />
-</testsuite></testsuites>""")
-    ok, _, error = RG._verify_junitxml(missing, ["tests/test_approved.py::test_kept"])
-    assert ok is False and "no testcase" in error
-    empty = _junitxml(tmp_path, "empty.xml", """<?xml version="1.0" encoding="utf-8"?>
-<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" time="0.0">
-</testsuite></testsuites>""")
-    ok, _, error = RG._verify_junitxml(empty, [])
-    assert ok is False and "no tests ran" in error
-    bad = _junitxml(tmp_path, "bad.xml", "not xml at all")
-    ok, _, error = RG._verify_junitxml(bad, ["tests/test_approved.py::test_kept"])
-    assert ok is False and "unparsable" in error
-    ok, _, error = RG._verify_junitxml(tmp_path / "does-not-exist.xml",
-                                        ["tests/test_approved.py::test_kept"])
-    assert ok is False and "missing" in error
+def test_verify_supervisor_rejects_failure_missing_and_malformed(tmp_path):
+    failing = _sup_events(("tests/test_approved.py::test_kept", "setup", "passed"),
+                          ("tests/test_approved.py::test_kept", "call", "failed"))
+    ok, _, error = RG._verify_supervisor_events(failing, ["tests/test_approved.py::test_kept"])
+    assert ok is False and "did not pass" in error
+    missing = _sup_events(("tests/test_approved.py::test_other", "setup", "passed"),
+                          ("tests/test_approved.py::test_other", "call", "passed"))
+    ok, _, error = RG._verify_supervisor_events(missing, ["tests/test_approved.py::test_kept"])
+    assert ok is False and "no test event" in error
+    # No session_start at all (e.g. pytest died before the plugin connected).
+    ok, _, error = RG._verify_supervisor_events([], ["tests/test_approved.py::test_kept"])
+    assert ok is False and "session_start" in error
+    # A test that only ever started (setup) but never ran its call phase.
+    started_only = [{"type": "session_start"},
+                    {"type": "test", "node": "tests/test_approved.py::test_kept",
+                     "phase": "setup", "outcome": "passed"}]
+    ok, _, error = RG._verify_supervisor_events(started_only, ["tests/test_approved.py::test_kept"])
+    assert ok is False and "did not pass" in error
+    # Full suite: zero passed (all skipped) is rejected.
+    all_skipped = _sup_events(("tests/test_a.py::test_one", "call", "skipped"),
+                              ("tests/test_a.py::test_two", "call", "skipped"))
+    ok, _, error = RG._verify_supervisor_events(all_skipped, [])
+    assert ok is False and "no passed test" in error
 
 
-def test_verify_junitxml_accepts_full_suite(tmp_path):
-    xml = _junitxml(tmp_path, "suite.xml", """<?xml version="1.0" encoding="utf-8"?>
-<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="1" tests="3" time="0.2">
-<testcase classname="tests.test_a" name="test_one" time="0.01" />
-<testcase classname="tests.test_a" name="test_two" time="0.01" />
-<testcase classname="tests.test_a" name="test_three" time="0.01"><skipped /></testcase>
-</testsuite></testsuites>""")
-    ok, summary, error = RG._verify_junitxml(xml, [])
+def test_verify_supervisor_accepts_full_suite(tmp_path):
+    events = _sup_events(("tests/test_a.py::test_one", "call", "passed"),
+                         ("tests/test_a.py::test_two", "call", "passed"),
+                         ("tests/test_a.py::test_three", "call", "skipped"))
+    ok, summary, error = RG._verify_supervisor_events(events, [])
     assert ok is True and error == ""
     assert summary["tests"] == 3 and summary["skipped"] == 1
+
+
+def test_forged_junitxml_and_early_exit_are_rejected(tmp_path):
+    """v3 regression: import-time code that writes a forged junitxml and
+    exits 0 (the R1 attack) must NOT produce a pass. The supervisor sees
+    no test event for the node, so the check fails closed even though the
+    process exited 0 and a well-formed forged XML exists on disk."""
+    subject = tmp_path / "subject"
+    (subject / "tests").mkdir(parents=True)
+    (subject / "tests" / "test_approved.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "xml = '<?xml version=\"1.0\" encoding=\"utf-8\"?>'\n"
+        "'<testsuites><testsuite name=\"pytest\" errors=\"0\" failures=\"0\" skipped=\"0\" tests=\"1\">'\n"
+        "'<testcase classname=\"tests.test_approved\" name=\"test_kept\" />'\n"
+        "'</testsuite></testsuites>'\n"
+        "Path(\"/tmp/forged-evidence.xml\").write_text(xml)\n"
+        "os._exit(0)\n")
+    registry = _pytest_registry(tmp_path)
+    result = tmp_path / "out" / "pytest-regression.json"
+    cmd = [sys.executable, str(SCRIPT), "check", "--subject", str(subject),
+           "--registry", str(registry), "--check-id", "pytest-regression",
+           "--result", str(result)]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    res = json.loads(result.read_text())
+    # The process exited 0, but no supervised test event exists.
+    assert res["exit_code"] == 0
+    assert res["evidence_verified"] is False
+    assert res["evidence_summary"]["tests"] == 0
+    assert "session_start" in res["evidence_error"] or "no test event" in res["evidence_error"]
+
+

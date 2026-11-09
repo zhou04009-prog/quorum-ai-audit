@@ -9,16 +9,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
+import threading
 from typing import Any
 
 SCHEMA = 1
@@ -79,55 +82,165 @@ def _parse_pytest_argv(argv: list[str]) -> tuple[list[str], list[str]]:
     return nodes, deselects
 
 
-def _verify_junitxml(xml_path: Path, nodes: list[str]) -> tuple[bool, dict[str, Any], str]:
-    """Verify structured pytest evidence.
+def _supervisor_node_matches(nodeid: str, node: str) -> bool:
+    """True when a supervisor event nodeid is the registry node.
 
-    The XML must exist, parse, and show every expected node actually ran
-    and passed (no failure/error/skipped child), with zero failures/errors
-    in the whole run. Returns (ok, summary, error). Output text is never
-    consulted: a PR-controlled plugin can print any string it likes."""
-    summary: dict[str, Any] = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
-    if not xml_path.is_file():
-        return False, summary, "junitxml evidence file missing"
-    try:
-        root = ET.parse(xml_path).getroot()
-    except ET.ParseError as exc:
-        return False, summary, f"junitxml evidence unparsable: {exc}"
-    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    cases = []
-    for suite in suites:
-        for attr in ("tests", "failures", "errors", "skipped"):
-            try:
-                summary[attr] += int(suite.get(attr, "0"))
-            except ValueError:
-                return False, summary, f"junitxml testsuite has non-numeric {attr}"
-        cases.extend(suite.findall("testcase"))
-    if summary["failures"] or summary["errors"]:
-        return False, summary, "junitxml reports failures or errors"
+    Both are pytest node ids ("path/test_x.py[::Class]::test_y", the
+    supervisor's test name possibly carrying a [param] suffix). The file
+    part, any class segments, and the test name must all match."""
+    want = node.split("::")
+    got = nodeid.split("::")
+    if len(got) != len(want) or got[0] != want[0]:
+        return False
+    if got[1:-1] != want[1:-1]:
+        return False
+    return got[-1].split("[", 1)[0] == want[-1]
+
+
+def _verify_supervisor_events(events: list[dict[str, Any]], nodes: list[str]) -> tuple[bool, dict[str, Any], str]:
+    """Verify structured supervisor evidence (v3).
+
+    The evidence is the authenticated event log recorded by the trusted
+    supervisor — a separate process that the tested code cannot write
+    to — not a file the test process produced. Each expected node must
+    have a "call" phase event with outcome "passed" and no phase with
+    outcome "failed"/"error"; a session_start event must be present
+    (the plugin connected and the session actually began). A full-suite
+    check (no expected nodes) requires at least one passed call event
+    and zero failed/error call events, so an all-skipped run is
+    rejected. Returns (ok, summary, error)."""
+    summary: dict[str, Any] = {"tests": 0, "failures": 0, "errors": 0,
+                               "skipped": 0, "events": len(events),
+                               "session_started": False, "session_finished": False}
+    if not any(e.get("type") == "session_start" for e in events):
+        return False, summary, "supervisor saw no session_start: the test session never began under supervision"
+    summary["session_started"] = True
+    summary["session_finished"] = any(e.get("type") == "session_finish" for e in events)
+    by_node: dict[str, dict[str, str]] = {}
+    call_passed = 0
+    for e in events:
+        if e.get("type") != "test":
+            continue
+        node, phase, outcome = e.get("node"), e.get("phase"), e.get("outcome")
+        if not isinstance(node, str) or not isinstance(phase, str) or not isinstance(outcome, str):
+            continue
+        by_node.setdefault(node, {})[phase] = outcome
+        if phase == "call":
+            summary["tests"] += 1
+            if outcome == "passed":
+                call_passed += 1
+            elif outcome == "failed":
+                summary["failures"] += 1
+            elif outcome == "error":
+                summary["errors"] += 1
+            elif outcome == "skipped":
+                summary["skipped"] += 1
     if nodes:
         found = []
         for node in nodes:
             classname, name = _node_parts(node)
             hit = None
-            for case in cases:
-                if case.get("classname") != classname:
-                    continue
-                cname = case.get("name", "")
-                if cname == name or cname.startswith(name + "["):
-                    hit = case
+            for nid, phases in by_node.items():
+                if _supervisor_node_matches(nid, node):
+                    hit = phases
                     break
             if hit is None:
-                return False, summary, f"junitxml has no testcase for node: {classname}::{name}"
-            if (hit.find("failure") is not None or hit.find("error") is not None
-                    or hit.find("skipped") is not None):
-                return False, summary, f"junitxml shows node did not pass: {classname}::{name}"
+                return False, summary, f"supervisor saw no test event for node: {classname}::{name}"
+            if hit.get("call") != "passed":
+                return False, summary, f"supervisor shows node did not pass: {classname}::{name} (call={hit.get('call')})"
+            if any(v in ("failed", "error") for v in hit.values()):
+                return False, summary, f"supervisor shows node failed in some phase: {classname}::{name}"
             found.append(f"{classname}::{name}")
         summary["nodes_verified"] = found
         if summary["tests"] < len(nodes):
-            return False, summary, "junitxml reports fewer tests than expected nodes"
-    elif summary["tests"] < 1:
-        return False, summary, "junitxml reports no tests ran"
+            return False, summary, "supervisor saw fewer test calls than expected nodes"
+    else:
+        if call_passed < 1:
+            return False, summary, "supervisor saw no passed test: zero tests or all skipped"
+        if summary["failures"] or summary["errors"]:
+            return False, summary, "supervisor reports failures or errors"
+    if summary["failures"] or summary["errors"]:
+        return False, summary, "supervisor reports failures or errors"
     return True, summary, ""
+
+
+class _Supervisor:
+    """Trusted out-of-band test supervisor (v3).
+
+    Listens on a Unix socket at a random path in a trusted temp dir and
+    records authenticated test lifecycle events sent by the trusted
+    pytest plugin. The tested code cannot write to this socket without
+    the per-run token, which reaches the plugin through a pipe FD that
+    is closed before any test code runs. The supervisor runs in the
+    executor process (a thread), so its event log is never a file the
+    test process produced or could overwrite."""
+
+    def __init__(self, sock_dir: Path, token: str):
+        self.sock_path = str(sock_dir / "supervisor.sock")
+        self.token = token
+        self.events: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(self.sock_path)
+        self._sock.listen(4)
+        self._sock.settimeout(0.25)
+        self._thread = threading.Thread(target=self._serve, daemon=True, name="quorum-supervisor")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                conn.settimeout(1.0)
+                buf = b""
+                while not self._stop.is_set():
+                    try:
+                        chunk = conn.recv(65536)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if not hmac.compare_digest(str(event.get("token", "")), self.token):
+                            continue
+                        event = {k: v for k, v in event.items() if k != "token"}
+                        with self._lock:
+                            self.events.append(event)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def stop(self) -> list[dict[str, Any]]:
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+        with self._lock:
+            return list(self.events)
 
 
 class IntakeError(ValueError):
@@ -277,39 +390,63 @@ def docs_only_changes(subject: Path, base: Path, github_base_sha: str) -> list[s
 def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) -> dict[str, Any]:
     """Run a trusted-registry pytest check through the hardened executor.
 
-    Trust boundary (v2, 2026-11-08 — replaces the F1 output-string check,
-    which a PR-controlled pytest config could forge via a plugin):
+    Trust boundary (v3, 2026-11-09 — replaces the v2 junitxml evidence
+    file, which the tested code could forge by writing to its predictable
+    path during import and exiting 0):
     - The subject's pytest config is never read: `-c /dev/null` plus
       `-o addopts=` means no pyproject.toml / pytest.ini / setup.cfg /
       tox.ini in the PR tree can add options or load plugins.
     - No conftest.py (`--noconftest`) and no plugin other than the cache
-      provider disable (`-p no:cacheprovider`); the registry argv is parsed
-      through a strict allowlist and the command is rebuilt from a fixed
-      template, so a registry entry can never smuggle in another flag.
+      provider disable (`-p no:cacheprovider`) plus the TRUSTED
+      supervisor plugin (`-p quorum_supervisor_plugin`, loaded from the
+      pinned verifier tree, never from the subject); the registry argv is
+      parsed through a strict allowlist and the command is rebuilt from a
+      fixed template, so a registry entry can never smuggle in another flag.
     - Python startup hooks in the subject tree cannot run: pytest is
       launched with a trusted temp dir as cwd and PYTHONPATH, so the
       subject root is never on sys.path at interpreter startup (site would
       otherwise execute its sitecustomize.py / .pth files). The package
       under test is exposed only through a symlink in that trusted dir,
       and --rootdir pins pytest's own root to the subject.
-    - Evidence is structured, not a string: pytest writes a junitxml
-      report, which this trusted code parses and verifies (the expected
-      node actually ran and passed). A forged pass string in the log is
-      worthless on its own.
+    - Evidence comes from a TRUSTED SUPERVISOR, not from a file: the
+      trusted plugin reports each test's start/finish/outcome to the
+      supervisor over a Unix socket, authenticated with a per-run token
+      that reaches the plugin through a pipe FD (closed before any test
+      code runs). The supervisor's event log is the sole evidence that
+      the expected test actually started, completed, and passed. There
+      is NO evidence file for the tested code to forge — pytest is not
+      even given a --junitxml path.
     Returns the check outcome fields for the result JSON."""
     nodes, deselects = _parse_pytest_argv(spec["argv"])
-    xml_path = result_path.with_suffix(".xml")
     shim_dir = Path(tempfile.mkdtemp(prefix="trusted-pytest-shim-"))
+    sup_dir = Path(tempfile.mkdtemp(prefix="trusted-supervisor-"))
     outcome: dict[str, Any] = {"exit_code": 1, "timed_out": False, "out": "", "err": "",
                                "evidence_verified": False, "evidence_summary": {},
                                "evidence_error": "", "executed_argv": []}
+    supervisor = None
     try:
         pkg = subject / "quorum"
         if pkg.is_dir():
             (shim_dir / "quorum").symlink_to(pkg, target_is_directory=True)
+        # Trusted supervisor plugin, from the pinned verifier tree (this
+        # file's own directory), exposed through the shim dir only.
+        plugin_src = Path(__file__).resolve().parent / "quorum_supervisor_plugin.py"
+        (shim_dir / "quorum_supervisor_plugin.py").symlink_to(plugin_src)
+        token = secrets.token_hex(32)
+        supervisor = _Supervisor(sup_dir, token)
+        supervisor.start()
+        # Pass the socket path + token to the plugin through a pipe FD.
+        # The plugin reads them at configure time and closes the FD
+        # before any test/subject code runs.
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, f"{supervisor.sock_path}\n{token}\n".encode("utf-8"))
+        finally:
+            os.close(wfd)
         cmd = ["python3", "-m", "pytest", "-c", "/dev/null", "-o", "addopts=",
                "--noconftest", "-p", "no:cacheprovider",
-               "--junitxml", str(xml_path), "--rootdir", str(subject)]
+               "-p", "quorum_supervisor_plugin",
+               "--rootdir", str(subject)]
         cmd.append("-v" if nodes else "-q")
         # --deselect takes a node id, matched against the collected tests'
         # rootdir-relative ids: it must stay in the registry's relative
@@ -326,10 +463,11 @@ def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) ->
         outcome["executed_argv"] = cmd
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL") if k in os.environ}
         env.update({"CI": "true", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
-                    "PYTHONPATH": str(shim_dir)})
+                    "PYTHONPATH": str(shim_dir),
+                    "QUORUM_SUPERVISOR_FD": str(rfd)})
         try:
             proc = subprocess.run(cmd, cwd=shim_dir, env=env, text=True,
-                                  capture_output=True,
+                                  capture_output=True, pass_fds=(rfd,),
                                   timeout=int(spec.get("timeout_seconds", 120)),
                                   check=False, errors="replace")
             outcome["exit_code"], outcome["out"], outcome["err"] = proc.returncode, proc.stdout, proc.stderr
@@ -341,17 +479,24 @@ def _run_pytest_check(subject: Path, spec: dict[str, Any], result_path: Path) ->
         except (OSError, ValueError) as exc:
             outcome["err"] = f"CHECK_EXEC_ERROR: {type(exc).__name__}: {exc}"
             outcome["exit_code"] = 127
-        ok, summary, error = _verify_junitxml(xml_path, nodes)
+        finally:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+        events = supervisor.stop() if supervisor is not None else []
+        ok, summary, error = _verify_supervisor_events(events, nodes)
         outcome["evidence_summary"] = summary
         outcome["evidence_error"] = error
         # Evidence is only meaningful when the command itself exited 0; a
         # non-zero exit is already a failed check (FAIL_REPRODUCED).
         outcome["evidence_verified"] = bool(outcome["exit_code"] == 0 and ok)
-        if xml_path.is_file():
-            outcome["junitxml_sha256"] = digest(xml_path.read_bytes())
-            outcome["junitxml_file"] = xml_path.name
+        outcome["supervisor_evidence_sha256"] = digest(
+            json.dumps(events, sort_keys=True).encode("utf-8"))
+        outcome["supervisor_events"] = len(events)
     finally:
         shutil.rmtree(shim_dir, ignore_errors=True)
+        shutil.rmtree(sup_dir, ignore_errors=True)
     return outcome
 
 
@@ -360,8 +505,9 @@ def cmd_check(a: argparse.Namespace) -> int:
 
     Pytest checks run through the hardened trusted executor
     (_run_pytest_check): the subject's pytest config, conftest and Python
-    startup hooks are all neutralised, and the pass verdict rests on a
-    parsed junitxml report, never on output strings (v2, 2026-11-08).
+    startup hooks are all neutralised, and the pass verdict rests on the
+    trusted supervisor's authenticated event log, never on output strings
+    and never on a file the test process produced (v3, 2026-11-09).
     Non-pytest approved commands run verbatim as before: they come from
     the trusted registry, have no test-run concept, and their exit code
     is their own evidence. The production registry is pytest-only."""
@@ -376,8 +522,8 @@ def cmd_check(a: argparse.Namespace) -> int:
     evidence_summary: dict[str, Any] = {}
     evidence_error = ""
     executed_argv: list[str] = list(spec["argv"])
-    junitxml_sha256 = None
-    junitxml_file = None
+    supervisor_evidence_sha256 = None
+    supervisor_events = None
     t0 = dt.datetime.now(dt.timezone.utc)
     if "pytest" in spec["argv"]:
         try:
@@ -394,8 +540,8 @@ def cmd_check(a: argparse.Namespace) -> int:
         evidence_summary = outcome["evidence_summary"]
         evidence_error = outcome["evidence_error"]
         executed_argv = outcome["executed_argv"]
-        junitxml_sha256 = outcome.get("junitxml_sha256")
-        junitxml_file = outcome.get("junitxml_file")
+        supervisor_evidence_sha256 = outcome.get("supervisor_evidence_sha256")
+        supervisor_events = outcome.get("supervisor_events")
         if not evidence_verified and code == 0:
             # The command exited 0 but produced no trustworthy evidence
             # that a test ran. Do not override the exit code: the audit
@@ -430,9 +576,9 @@ def cmd_check(a: argparse.Namespace) -> int:
                               "evidence_error": evidence_error,
                               "duration_seconds": round((dt.datetime.now(dt.timezone.utc)-t0).total_seconds(), 3),
                               "log_sha256": digest(log.encode("utf-8")), "log_file": log_path.name}
-    if junitxml_sha256 is not None:
-        result["junitxml_sha256"] = junitxml_sha256
-        result["junitxml_file"] = junitxml_file
+    if supervisor_evidence_sha256 is not None:
+        result["supervisor_evidence_sha256"] = supervisor_evidence_sha256
+        result["supervisor_events"] = supervisor_events
     write_json(result_path, result)
     print(f"APPROVED_CHECK id={check_id} exit={code} evidence={result_path} log_sha256={digest(log.encode('utf-8'))}")
     if code != 0:
